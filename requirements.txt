@@ -1,0 +1,26 @@
+# Core
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-dotenv==1.0.1
+pydantic==2.10.3
+pydantic-settings==2.6.1
+
+# Neo4j
+neo4j==5.26.0
+
+# Anthropic (Claude Vision)
+anthropic==0.40.0
+
+# Voyage AI (embeddings — Anthropic's first-party embedding service)
+voyageai==0.3.2
+
+# Utilities
+python-multipart==0.0.12
+httpx==0.28.0
+numpy==2.2.0
+Pillow==11.0.0       # used in tests to generate synthetic images
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.24.0
+pytest-mock==3.14.0
