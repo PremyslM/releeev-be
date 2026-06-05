@@ -12,7 +12,7 @@ import asyncio
 import hashlib
 import logging
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
 from functools import lru_cache
 
@@ -23,7 +23,7 @@ from fastapi.responses import JSONResponse
 
 from src import queries as Q
 from src.config import settings
-from src.link_engine import findSimilarCaptures, persistLinks
+from src.link_engine import DOMAIN_TOPICS, findSimilarCaptures, persistLinks
 from src.models import (
     AnalyzeCaptureRequest,
     AnalyzeCaptureResponse,
@@ -123,6 +123,7 @@ async def _persist_capture(capture: CaptureNode) -> None:
             language=attrs.language,
             sentiment=attrs.sentiment,
             confidence=attrs.confidence,
+            capture_type=attrs.capture_type.value,
             created_at=capture.created_at.isoformat(),
             embedding=capture.embedding,
         )
@@ -220,6 +221,16 @@ async def analyze_capture(req: AnalyzeCaptureRequest) -> AnalyzeCaptureResponse:
         logger.warning("Link engine error (non-fatal): %s", exc)
         linked = []
 
+    # ── Auto-maintenance: record source + group into a Subject branch ─────────
+    subject_name = None
+    try:
+        subject_name = await _auto_group_on_upload(
+            capture.id, attributes.title, attributes.summary,
+            attributes.raw_text, embedding,
+        )
+    except Exception as exc:
+        logger.warning("Auto-group on upload failed (non-fatal): %s", exc)
+
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
 
     return AnalyzeCaptureResponse(
@@ -228,6 +239,7 @@ async def analyze_capture(req: AnalyzeCaptureRequest) -> AnalyzeCaptureResponse:
         embedding_dim=len(embedding),
         linked_to=linked,
         processing_ms=elapsed_ms,
+        subject_name=subject_name,
     )
 
 
@@ -395,6 +407,12 @@ async def search_captures(
     limit: int = Query(default=20, ge=1, le=100),
     mode: str = Query(default="hybrid", description="'hybrid' | 'semantic' | 'fulltext'"),
     expand: bool = Query(default=True, description="Use Claude to expand/translate query"),
+    category: str | None = Query(default=None, description="Filter by domain, e.g. 'automotive'"),
+    source: str | None = Query(default=None, description="Filter by source, e.g. 'alza.cz'"),
+    lang: str | None = Query(default=None, description="Filter by language, e.g. 'cs'"),
+    ctype: str | None = Query(default=None, alias="type", description="Filter by capture_type"),
+    from_date: str | None = Query(default=None, alias="from", description="From date YYYY-MM-DD"),
+    to_date: str | None = Query(default=None, alias="to", description="To date YYYY-MM-DD"),
 ) -> SearchResponse:
     """
     Fast multilingual hybrid search:
@@ -484,27 +502,89 @@ async def search_captures(
 
     if tasks:
         done = await asyncio.gather(*tasks.values(), return_exceptions=True)
-        for source, result in zip(tasks.keys(), done):
+        for src_name, result in zip(tasks.keys(), done):
             if isinstance(result, Exception):
-                logger.warning("Search source %s failed: %s", source, result)
-                ranked[source] = []
+                logger.warning("Search source %s failed: %s", src_name, result)
+                ranked[src_name] = []
             else:
-                ranked[source] = result
+                ranked[src_name] = result
 
     # ── Reciprocal Rank Fusion ────────────────────────────────────────────────
     fused: dict[str, float] = defaultdict(float)
-    for source, ids in ranked.items():
-        w = _RRF_WEIGHTS.get(source, 1.0)
+    for src_name, ids in ranked.items():
+        w = _RRF_WEIGHTS.get(src_name, 1.0)
         for rank, cid in enumerate(ids):
             fused[cid] += w / (_RRF_K + rank)
 
-    # Normalize to 0..1 and drop the low-relevance tail. For a short query the
-    # vector index returns *something* for every doc; RRF ranks them correctly
-    # but the bottom is noise (e.g. 100/99/75% real matches, then 26-32% junk).
-    # Keeping only results within 0.40 of the top yields a clean, precise list.
-    top = max(fused.values()) if fused else 1.0
-    ordered = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)
+    ordered_all = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)
 
+    # Drop the low-relevance tail FIRST (independent of any active facet). For a
+    # short query the vector index returns *something* for every doc; RRF ranks
+    # them correctly but the bottom is noise (e.g. 100/99/75% matches, then 26-32%
+    # junk). Keep only items within 40% of the top — that's the "relevant set".
+    top_all = ordered_all[0][1] if ordered_all else 1.0
+    relevant = [(cid, sc) for cid, sc in ordered_all if (sc / top_all) >= _MIN_RESULT_SCORE]
+
+    # ── Fetch structured fields for the relevant matches (one batched lookup) ──
+    facet_map: dict[str, dict] = {}
+    if relevant:
+        async with get_session() as s:
+            rec = await s.run(Q.GET_CAPTURE_FACETS, ids=[cid for cid, _ in relevant])
+            async for row in rec:
+                facet_map[row["id"]] = {
+                    "language": (row["language"] or "").lower(),
+                    "source": (row["source"] or "").lower(),
+                    "capture_type": (row["capture_type"] or "").lower(),
+                    "created_at": _to_native(row["created_at"]),
+                    "topics": row["topics"] or [],  # already lowercased in Cypher
+                }
+
+    # ── Auto-derived refinement chips over the relevant set ───────────────────
+    cat_c, src_c, lang_c = Counter(), Counter(), Counter()
+    for cid, _ in relevant:
+        f = facet_map.get(cid)
+        if not f:
+            continue
+        cat = next((t for t in f["topics"] if t in DOMAIN_TOPICS), None)
+        if cat:
+            cat_c[cat] += 1
+        if f["source"] and f["source"] != "neznámý zdroj":
+            src_c[f["source"]] += 1
+        if f["language"]:
+            lang_c[f["language"]] += 1
+    facets: dict[str, dict] = {}
+    if len(cat_c) > 1:
+        facets["category"] = dict(cat_c.most_common())
+    if len(src_c) > 1:
+        facets["source"] = dict(src_c.most_common())
+    if len(lang_c) > 1:
+        facets["lang"] = dict(lang_c.most_common())
+
+    # ── Apply the user's active facet filter (if any) ─────────────────────────
+    def _passes(cid: str) -> bool:
+        f = facet_map.get(cid)
+        if f is None:
+            return False
+        if category and category.lower() not in f["topics"]:
+            return False
+        if source and source.lower() not in f["source"]:
+            return False
+        if lang and f["language"] != lang.lower():
+            return False
+        if ctype and f["capture_type"] != ctype.lower():
+            return False
+        if (from_date or to_date) and f["created_at"] is not None:
+            day = f["created_at"].date().isoformat()
+            if from_date and day < from_date:
+                return False
+            if to_date and day > to_date:
+                return False
+        return True
+
+    facets_active = any([category, source, lang, ctype, from_date, to_date])
+    final = [(cid, sc) for cid, sc in relevant if (not facets_active or _passes(cid))]
+
+    top = final[0][1] if final else 1.0
     results = [
         SearchResult(
             capture_id=cid,
@@ -513,10 +593,9 @@ async def search_captures(
             score=round(score / top, 4),
             created_at=meta[cid]["created_at"],
         )
-        for cid, score in ordered
-        if (score / top) >= _MIN_RESULT_SCORE
+        for cid, score in final
     ][:limit]
-    return SearchResponse(query=q, results=results, total=len(results))
+    return SearchResponse(query=q, results=results, total=len(results), facets=facets)
 
 
 # ── Re-extract topics from stored text (for captures with empty topics) ──────
@@ -974,6 +1053,63 @@ async def group_subjects(threshold: float = Query(default=0.85, ge=0.70, le=1.0)
             if subjects else "Žádné skupiny stejných předmětů nenalezeny."
         ),
     }
+
+
+async def _auto_group_on_upload(
+    capture_id: str, title: str, summary: str, raw_text: str, embedding: list[float]
+) -> str | None:
+    """
+    Maintenance run automatically after each upload:
+      1. records the capture's `source` (website domain / generic),
+      2. if it depicts the same thing as an existing capture, attaches it to that
+         capture's Subject branch (or creates a new one) — non-destructively.
+    Returns the Subject name if grouped, else None.
+    """
+    import uuid
+
+    async with get_session() as session:
+        source = _extract_source(title, summary, raw_text)
+        await session.run(Q.SET_CAPTURE_SOURCE, id=capture_id, source=source)
+
+        if not embedding or not any(v != 0.0 for v in embedding[:10]):
+            return None
+        try:
+            rec = await session.run(Q.SEMANTIC_SEARCH, embedding=embedding, k=10, limit=10)
+            neighbours = [r async for r in rec]
+        except Exception as exc:
+            logger.warning("Auto-group scan failed: %s", exc)
+            return None
+
+        matched: list[tuple[str, str]] = []
+        for n in neighbours:
+            nid = n["capture_id"]
+            if nid == capture_id:
+                continue
+            sim = float(n["score"])
+            if sim < 0.85:
+                break  # neighbours are sorted by similarity desc
+            if _same_subject(title, n["title"] or "", sim):
+                matched.append((nid, n["title"] or ""))
+        if not matched:
+            return None
+
+        matched_ids = [m[0] for m in matched]
+
+        # Reuse an existing Subject if one of the matches already has one
+        srec = await (await session.run(Q.GET_SUBJECT_FOR_CAPTURES, ids=matched_ids)).single()
+        if srec is not None:
+            sid, name, kind = srec["subject_id"], srec["subject_name"], srec["subject_kind"]
+            members = [capture_id]  # MERGE adds this one; existing members stay
+        else:
+            sid = str(uuid.uuid4())
+            cleaned = [_clean_subject_title(t) for t in [title, *(m[1] for m in matched)]]
+            name = min(cleaned, key=len)
+            kind = "produkt" if "." in source else "věc"
+            members = [capture_id, *matched_ids]
+
+        await session.run(Q.UPSERT_SUBJECT, id=sid, name=name, kind=kind, capture_ids=members)
+        logger.info("Auto-grouped %s into subject %r (%d sources)", capture_id[:8], name, len(members))
+        return name
 
 
 # ── Relink all captures (recompute LINKED_TO with current engine settings) ───

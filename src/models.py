@@ -113,6 +113,7 @@ class AnalyzeCaptureResponse(BaseModel):
     embedding_dim: int
     linked_to: list[LinkedCapture] = Field(default_factory=list)
     processing_ms: int = 0
+    subject_name: str | None = None  # set if auto-grouped into a Subject branch
 
 
 class SubjectSibling(BaseModel):
@@ -147,6 +148,10 @@ class SearchResponse(BaseModel):
     query: str
     results: list[SearchResult]
     total: int
+    # Auto-derived refinement chips: {facet_type: {value: count}} over the
+    # relevant matches. The UI renders these as one-click filters — the user
+    # never configures anything.
+    facets: dict[str, dict[str, int]] = Field(default_factory=dict)
 
 
 # ── Error model ────────────────────────────────────────────────────────────────

@@ -87,15 +87,16 @@ ORDER BY score DESC
 
 UPSERT_CAPTURE = """
 MERGE (c:Capture {id: $id})
-SET   c.title      = $title,
-      c.summary    = $summary,
-      c.raw_text   = $raw_text,
-      c.image_hash = $image_hash,
-      c.language   = $language,
-      c.sentiment  = $sentiment,
-      c.confidence = $confidence,
-      c.created_at = datetime($created_at),
-      c.embedding  = $embedding
+SET   c.title        = $title,
+      c.summary      = $summary,
+      c.raw_text     = $raw_text,
+      c.image_hash   = $image_hash,
+      c.language     = $language,
+      c.sentiment    = $sentiment,
+      c.confidence   = $confidence,
+      c.capture_type = $capture_type,
+      c.created_at   = datetime($created_at),
+      c.embedding    = $embedding
 RETURN c
 """
 
@@ -323,4 +324,25 @@ GET_SUBJECTS_GRAPH = """
 MATCH (s:Subject)<-[:DEPICTS]-(c:Capture)
 RETURN s.id AS subject_id, s.name AS subject_name, s.kind AS subject_kind,
        collect(c.id) AS capture_ids
+"""
+
+# Find an existing Subject that any of the given captures already belongs to
+GET_SUBJECT_FOR_CAPTURES = """
+MATCH (c:Capture)-[:DEPICTS]->(s:Subject)
+WHERE c.id IN $ids
+RETURN s.id AS subject_id, s.name AS subject_name, s.kind AS subject_kind
+LIMIT 1
+"""
+
+# ── Faceted search: fetch filterable fields for a set of candidate captures ──
+GET_CAPTURE_FACETS = """
+MATCH (c:Capture)
+WHERE c.id IN $ids
+OPTIONAL MATCH (c)-[:HAS_TOPIC]->(t:Topic)
+RETURN c.id           AS id,
+       c.language     AS language,
+       c.source       AS source,
+       c.capture_type AS capture_type,
+       c.created_at   AS created_at,
+       collect(toLower(t.name)) AS topics
 """

@@ -47,6 +47,11 @@ najde + uloží vazby na existující záchyty.
 Obsahuje **deduplikaci podle hash** — pokud nahraješ bajtově shodný obrázek,
 vrátí se existující záchyt bez nového volání Claude.
 
+**Automatická údržba:** po uložení a propojení se nový záchyt automaticky zařadí
+do **větve předmětu** (`Subject`), pokud zobrazuje stejnou věc jako existující
+záchyt (např. stejný produkt z jiného e-shopu). Není třeba ručně volat
+`/group-subjects`. Pokud k zařazení došlo, vrátí se název větve v `subject_name`.
+
 **Request body** — [`AnalyzeCaptureRequest`](#analyzecapturerequest)
 
 ```json
@@ -87,7 +92,8 @@ vrátí se existující záchyt bez nového volání Claude.
       "reasons": ["témata: electric vehicle, Tesla", "kategorie: automotive"]
     }
   ],
-  "processing_ms": 4120
+  "processing_ms": 4120,
+  "subject_name": null
 }
 ```
 
@@ -162,28 +168,44 @@ Funguje cross-lingválně — český dotaz najde anglický obsah.
 
 | Param    | Typ    | Default    | Popis |
 |----------|--------|------------|-------|
-| `q`      | string | (povinné)  | Dotaz v jakémkoliv jazyce, min. délka 1 |
-| `limit`  | int    | `20`       | Max. počet výsledků (1–100) |
-| `mode`   | string | `hybrid`   | `hybrid` \| `semantic` \| `fulltext` |
-| `expand` | bool   | `true`     | Claude expanze/překlad krátkých cizojazyčných dotazů |
+| `q`        | string | (povinné)  | Dotaz v jakémkoliv jazyce, min. délka 1 |
+| `limit`    | int    | `20`       | Max. počet výsledků (1–100) |
+| `mode`     | string | `hybrid`   | `hybrid` \| `semantic` \| `fulltext` |
+| `expand`   | bool   | `true`     | Claude expanze/překlad krátkých cizojazyčných dotazů |
+| `category` | string | —          | Filtr podle domény, např. `automotive`, `watches` |
+| `source`   | string | —          | Filtr podle zdroje, např. `alza.cz` (substring) |
+| `lang`     | string | —          | Filtr podle jazyka, např. `cs`, `en` |
+| `type`     | string | —          | Filtr podle `capture_type` (`screenshot`/`photo`/…) |
+| `from`     | string | —          | Od data `YYYY-MM-DD` (včetně) |
+| `to`       | string | —          | Do data `YYYY-MM-DD` (včetně) |
+
+> Facety lze libovolně kombinovat: `?q=tutorial&category=programming&lang=cs`.
+> Relevance se normalizuje vůči nejlepšímu výsledku **po** aplikaci filtrů.
 
 **Response 200** — [`SearchResponse`](#searchresponse)
 
 ```json
 {
-  "query": "tesla",
+  "query": "boty",
   "results": [
-    { "capture_id": "cd3d60e7-…", "title": "YouTube video … Tesla Model 3",
-      "summary": "…", "score": 1.0, "created_at": "2026-06-04T12:00:00" },
-    { "capture_id": "40599d7f-…", "title": "Tesla Electric SUV …",
-      "summary": "…", "score": 0.99, "created_at": "2026-06-04T12:01:00" }
+    { "capture_id": "…", "title": "Converse Chuck Taylor All Star",
+      "summary": "…", "score": 1.0, "created_at": "2026-06-04T12:00:00" }
   ],
-  "total": 3
+  "total": 5,
+  "facets": {
+    "category": { "fashion": 4, "watches": 1 },
+    "lang": { "cs": 3, "en": 2 }
+  }
 }
 ```
 
 > `score` je normalizovaná relevance v rozsahu `0–1` (1.0 = nejlepší shoda).
 > Výsledky pod 40 % top skóre se odřezávají jako šum.
+>
+> **`facets`** = automaticky odvozené možnosti zúžení nad aktuálními výsledky
+> (`{typ: {hodnota: počet}}`). Klient z nich vykreslí klikací filtry — uživatel
+> nic nenastavuje. Vrací se jen typy s ≥ 2 různými hodnotami (jinak není co
+> filtrovat). Kliknutím se přidá odpovídající facet parametr a hledání se zopakuje.
 
 **Příklad**
 
