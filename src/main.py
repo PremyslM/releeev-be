@@ -32,6 +32,8 @@ from src.models import (
     LinkType,
     SearchResponse,
     SearchResult,
+    SubjectInfo,
+    SubjectSibling,
 )
 from src.neo4j_driver import close_driver, get_session
 from src.schema_setup import run_schema_setup
@@ -281,20 +283,40 @@ async def get_capture(capture_id: str) -> CaptureDetailResponse:
                     other_title=row.get("other_title") or "",
                     other_summary=row.get("other_summary") or "",
                     shared_topics=shared,
+                    reasons=[r for r in (row.get("reasons") or []) if r],
                 )
             )
 
-        # Deprioritize temporal proximity — hide it if better links exist
-        has_better = any(
-            c.link_type != LinkType.temporal_proximity
-            for c in raw_connections
-        )
-        connections = [
-            c for c in raw_connections
-            if not (c.link_type == LinkType.temporal_proximity and has_better)
-        ]
+        # No post-filtering needed: the evidence-accumulation engine already
+        # produces honest, comparable strengths. The UI tiers links into
+        # "silné / slabší" by strength, so weak links are simply ranked lower.
+        connections = sorted(raw_connections, key=lambda c: c.strength, reverse=True)
 
-    return CaptureDetailResponse(capture=capture, connections=connections)
+        # Subject branch: is this capture one source of a grouped real-world thing?
+        subject = None
+        try:
+            subj_result = await session.run(Q.GET_CAPTURE_SUBJECT, id=capture_id)
+            subj_rec = await subj_result.single()
+            if subj_rec is not None:
+                siblings = [
+                    SubjectSibling(
+                        id=s["id"],
+                        title=s.get("title") or "",
+                        source=s.get("source") or "",
+                    )
+                    for s in (subj_rec.get("siblings") or [])
+                    if s and s.get("id") != capture_id  # exclude self
+                ]
+                subject = SubjectInfo(
+                    subject_id=subj_rec["subject_id"],
+                    name=subj_rec.get("subject_name") or "",
+                    kind=subj_rec.get("subject_kind") or "",
+                    siblings=siblings,
+                )
+        except Exception as exc:
+            logger.debug("Subject lookup failed for %s: %s", capture_id[:8], exc)
+
+    return CaptureDetailResponse(capture=capture, connections=connections, subject=subject)
 
 
 def _expand_query_with_claude(q: str) -> str:
@@ -669,6 +691,276 @@ async def reembed_all(force: bool = Query(default=False, description="Re-embed A
     }
 
 
+# ── Merge near-duplicate captures ────────────────────────────────────────────
+
+import re as _re
+
+
+def _norm_title(t: str) -> str:
+    """Normalize a title for duplicate comparison: lowercase, alnum-only."""
+    return _re.sub(r"[^a-z0-9]+", " ", (t or "").lower()).strip()
+
+
+def _title_jaccard(a: str, b: str) -> float:
+    """Token-level Jaccard similarity of two normalized titles."""
+    ta, tb = set(_norm_title(a).split()), set(_norm_title(b).split())
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def _are_same_entity(title_a: str, title_b: str, sim: float) -> bool:
+    """
+    Decide whether two captures are the SAME real-world entity (mergeable).
+
+    Embedding similarity alone is not enough — a YouTube video about a Tesla and
+    a Tesla article can both score ~0.95 yet are different captures. We require
+    title agreement as well:
+        • identical normalized title                          → merge
+        • OR very high embedding (≥0.97) AND title Jaccard ≥0.6 → merge
+    """
+    if _norm_title(title_a) and _norm_title(title_a) == _norm_title(title_b):
+        return True
+    return sim >= 0.97 and _title_jaccard(title_a, title_b) >= 0.6
+
+
+async def _merge_capture_nodes(session, keep_id: str, drop_id: str) -> None:
+    """Move every edge from `drop` onto `keep`, record provenance, delete `drop`."""
+    await session.run(Q.MERGE_MOVE_TOPICS,    keep=keep_id, drop=drop_id)
+    await session.run(Q.MERGE_MOVE_MENTIONS,  keep=keep_id, drop=drop_id)
+    await session.run(Q.MERGE_MOVE_LINKS_OUT, keep=keep_id, drop=drop_id)
+    await session.run(Q.MERGE_MOVE_LINKS_IN,  keep=keep_id, drop=drop_id)
+    await session.run(Q.MERGE_FINALIZE,       keep=keep_id, drop=drop_id)
+
+
+@app.post("/merge-duplicates", summary="Merge near-duplicate captures into one node")
+async def merge_duplicates(threshold: float = Query(default=0.88, ge=0.80, le=1.0)):
+    """
+    Finds captures that are the SAME real-world entity (e.g. two screenshots of
+    the same product page) and merges each duplicate into the oldest canonical
+    capture — transferring its topics, entities and links, then deleting it.
+
+    `threshold` is the candidate gate: only pairs at least this similar are
+    considered. The final merge decision additionally requires title agreement
+    (identical normalized title, or ≥0.6 token overlap at ≥0.97 sim) so that
+    merely-similar-but-distinct captures (e.g. a Tesla video vs a Tesla article,
+    both ~0.95) are never merged. Self-links from the merge are cleaned up after.
+    """
+    async with get_session() as session:
+        result = await session.run(Q.GET_ALL_CAPTURES_FULL)
+        records = [r async for r in result]
+
+    # Build lookup; iterate oldest-first so the canonical is the earliest capture
+    by_id = {r["id"]: {"title": r["title"] or "", "embedding": list(r["embedding"] or [])}
+             for r in records}
+    order = [r["id"] for r in records]
+    removed: set[str] = set()
+    merges: list[dict] = []
+
+    async with get_session() as session:
+        for cid in order:
+            if cid in removed:
+                continue
+            emb = by_id[cid]["embedding"]
+            if not emb or not any(v != 0.0 for v in emb[:10]):
+                continue
+
+            # Find vector neighbours of this capture
+            try:
+                rec = await session.run(
+                    Q.SEMANTIC_SEARCH, embedding=emb, k=10, limit=10
+                )
+                neighbours = [r async for r in rec]
+            except Exception as exc:
+                logger.warning("Duplicate scan failed for %s: %s", cid[:8], exc)
+                continue
+
+            for n in neighbours:
+                nid = n["capture_id"]
+                if nid == cid or nid in removed:
+                    continue
+                sim = float(n["score"])
+                if sim < threshold:
+                    continue  # results are sorted desc → no closer ones remain
+                if _are_same_entity(by_id[cid]["title"], by_id.get(nid, {}).get("title", n["title"] or ""), sim):
+                    await _merge_capture_nodes(session, keep_id=cid, drop_id=nid)
+                    removed.add(nid)
+                    merges.append({
+                        "kept": cid, "kept_title": by_id[cid]["title"],
+                        "merged": nid, "similarity": round(sim, 3),
+                    })
+                    logger.info("Merged duplicate %s → %s (sim=%.3f)", nid[:8], cid[:8], sim)
+
+        # Remove any accidental self-links left behind
+        await session.run("MATCH (c:Capture)-[r:LINKED_TO]->(c) DELETE r")
+
+    return {
+        "status": "done",
+        "merged_pairs": len(merges),
+        "remaining_captures": len(order) - len(removed),
+        "details": merges,
+        "message": f"Sloučeno {len(merges)} duplicit, zůstává {len(order) - len(removed)} záznamů.",
+    }
+
+
+# ── Subject branches: group same-entity captures across sources ──────────────
+
+_DOMAIN_RE = _re.compile(
+    r"\b([a-z0-9][a-z0-9\-]{1,}\.(?:cz|com|sk|net|org|io|eu|de|shop|store))\b", _re.I
+)
+
+
+def _extract_source(title: str, summary: str, raw_text: str) -> str:
+    """Best-effort source label for a capture (website domain, else generic)."""
+    for txt in (title, summary, raw_text):
+        m = _DOMAIN_RE.search(txt or "")
+        if m:
+            return m.group(1).lower()
+    return "neznámý zdroj"
+
+
+def _distinctive_tokens(title: str) -> set[str]:
+    """Model-number-like tokens (letters+digits) — strong same-product anchors."""
+    return {
+        t for t in _norm_title(title).split()
+        if len(t) >= 5 and any(c.isdigit() for c in t) and any(c.isalpha() for c in t)
+    }
+
+
+def _same_subject(title_a: str, title_b: str, sim: float) -> bool:
+    """
+    Looser than _are_same_entity (merge): grouping is non-destructive, so we can
+    be more permissive. Two captures depict the same Subject if they are quite
+    similar AND share strong title evidence (identical title, a shared model
+    number, or solid token overlap).
+    """
+    if sim < 0.85:
+        return False
+    if _norm_title(title_a) and _norm_title(title_a) == _norm_title(title_b):
+        return True
+    if _distinctive_tokens(title_a) & _distinctive_tokens(title_b):
+        return True
+    return _title_jaccard(title_a, title_b) >= 0.5
+
+
+def _clean_subject_title(title: str) -> str:
+    """Strip source suffix / boilerplate to get a clean canonical Subject name."""
+    s = title or ""
+    # remove " on Alza.cz", " - mall.cz", " | shop.com" …
+    s = _re.sub(
+        r"\s*(?:on|@|[-|–—])\s*[A-Za-z0-9.\- ]*\.(?:cz|com|sk|net|org|io|eu|de|shop|store)\b.*$",
+        "", s, flags=_re.I,
+    )
+    # remove trailing boilerplate words
+    s = _re.sub(r"\s*[-|–—]?\s*\b(?:product page|product listing|listing|product|page)\b\s*$",
+                "", s, flags=_re.I)
+    return s.strip(" -|–—") or (title or "").strip()
+
+
+@app.post("/group-subjects", summary="Group captures of the same thing into Subject branches")
+async def group_subjects(threshold: float = Query(default=0.85, ge=0.70, le=1.0)):
+    """
+    Builds :Subject branches. Captures depicting the same real-world thing — the
+    same product seen on Alza / another e-shop / a personal photo — are grouped
+    under one (Capture)-[:DEPICTS]->(Subject) hub, WITHOUT deleting any capture.
+    Each capture keeps its `source`, so the branch shows where you saw the thing.
+
+    Non-destructive: re-runnable. Rebuilds all Subjects from scratch each call.
+    """
+    import uuid
+
+    async with get_session() as session:
+        result = await session.run(Q.GET_ALL_CAPTURES_FULL)
+        records = [r async for r in result]
+
+    caps = {
+        r["id"]: {
+            "title": r["title"] or "",
+            "embedding": list(r["embedding"] or []),
+            "source": _extract_source(r["title"] or "", r["summary"] or "", r["raw_text"] or ""),
+        }
+        for r in records
+    }
+    order = [r["id"] for r in records]
+
+    # Union-find to cluster same-subject captures
+    parent: dict[str, str] = {cid: cid for cid in order}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    async with get_session() as session:
+        # Persist each capture's source label
+        for cid, c in caps.items():
+            await session.run(Q.SET_CAPTURE_SOURCE, id=cid, source=c["source"])
+
+        # Discover same-subject pairs via the vector index
+        for cid in order:
+            emb = caps[cid]["embedding"]
+            if not emb or not any(v != 0.0 for v in emb[:10]):
+                continue
+            try:
+                rec = await session.run(Q.SEMANTIC_SEARCH, embedding=emb, k=10, limit=10)
+                neighbours = [r async for r in rec]
+            except Exception as exc:
+                logger.warning("Subject scan failed for %s: %s", cid[:8], exc)
+                continue
+            for n in neighbours:
+                nid = n["capture_id"]
+                if nid == cid or nid not in caps:
+                    continue
+                sim = float(n["score"])
+                if sim < threshold:
+                    continue
+                if _same_subject(caps[cid]["title"], caps[nid]["title"], sim):
+                    union(cid, nid)
+
+        # Build clusters
+        clusters: dict[str, list[str]] = {}
+        for cid in order:
+            clusters.setdefault(find(cid), []).append(cid)
+
+        # Rebuild Subjects from scratch
+        await session.run(Q.CLEAR_SUBJECTS)
+        subjects = []
+        for members in clusters.values():
+            if len(members) < 2:
+                continue  # a lone capture needs no Subject branch
+            titles = [caps[m]["title"] for m in members]
+            # canonical name = most common cleaned title (tie → shortest)
+            cleaned = [_clean_subject_title(t) for t in titles]
+            name = min(
+                sorted(set(cleaned), key=cleaned.count, reverse=True)[:1] or cleaned,
+                key=len,
+            )
+            sources = sorted({caps[m]["source"] for m in members})
+            kind = "produkt" if any("." in s for s in sources) else "věc"
+            sid = str(uuid.uuid4())
+            await session.run(
+                Q.UPSERT_SUBJECT, id=sid, name=name, kind=kind, capture_ids=members
+            )
+            subjects.append({"name": name, "kind": kind, "sources": sources, "captures": len(members)})
+
+    return {
+        "status": "done",
+        "subjects": len(subjects),
+        "details": subjects,
+        "message": (
+            f"Vytvořeno {len(subjects)} větví (předmětů). "
+            + "; ".join(f"{s['name']} ({s['captures']}× — {', '.join(s['sources'])})" for s in subjects)
+            if subjects else "Žádné skupiny stejných předmětů nenalezeny."
+        ),
+    }
+
+
 # ── Relink all captures (recompute LINKED_TO with current engine settings) ───
 
 @app.post("/relink", summary="Delete all links and recompute them from scratch")
@@ -746,7 +1038,7 @@ async def get_graph_data():
         result = await session.run(
             "MATCH (c:Capture) "
             "RETURN c.id AS id, c.title AS title, c.summary AS summary, "
-            "       c.created_at AS created_at"
+            "       c.created_at AS created_at, coalesce(c.merged_count, 1) AS merged_count"
         )
         async for rec in result:
             nodes.append({
@@ -754,6 +1046,8 @@ async def get_graph_data():
                 "label": (rec["title"] or "")[:35],
                 "title": (rec["summary"] or "")[:120],
                 "created_at": str(rec["created_at"]),
+                "merged_count": rec["merged_count"],
+                "type": "capture",
             })
 
         # All links
@@ -768,7 +1062,27 @@ async def get_graph_data():
                 "to": rec["to_id"],
                 "value": float(rec["strength"] or 0.5),
                 "title": rec["link_type"] or "",
+                "type": "link",
             })
+
+        # Subject branches: a hub node per Subject + a DEPICTS branch per capture
+        result = await session.run(Q.GET_SUBJECTS_GRAPH)
+        async for rec in result:
+            sid = rec["subject_id"]
+            nodes.append({
+                "id": sid,
+                "label": rec["subject_name"] or "Předmět",
+                "title": f"{rec['subject_kind'] or 'předmět'} · {len(rec['capture_ids'])} zdrojů",
+                "type": "subject",
+            })
+            for cid in rec["capture_ids"]:
+                edges.append({
+                    "from": sid,
+                    "to": cid,
+                    "value": 1.0,
+                    "title": "DEPICTS",
+                    "type": "depicts",
+                })
 
     return {"nodes": nodes, "edges": edges}
 

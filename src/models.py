@@ -82,6 +82,7 @@ class CaptureLink(BaseModel):
     other_title: str = ""
     other_summary: str = ""
     shared_topics: list[str] = Field(default_factory=list)
+    reasons: list[str] = Field(default_factory=list)  # why these are linked
 
 
 # ── API request / response models ─────────────────────────────────────────────
@@ -103,6 +104,7 @@ class LinkedCapture(BaseModel):
     strength: float
     title: str = ""
     summary: str = ""
+    reasons: list[str] = Field(default_factory=list)  # why these are linked
 
 
 class AnalyzeCaptureResponse(BaseModel):
@@ -113,9 +115,24 @@ class AnalyzeCaptureResponse(BaseModel):
     processing_ms: int = 0
 
 
+class SubjectSibling(BaseModel):
+    id: str
+    title: str = ""
+    source: str = ""
+
+
+class SubjectInfo(BaseModel):
+    """The real-world thing this capture depicts, seen across several sources."""
+    subject_id: str
+    name: str = ""
+    kind: str = ""
+    siblings: list[SubjectSibling] = Field(default_factory=list)
+
+
 class CaptureDetailResponse(BaseModel):
     capture: CaptureNode
     connections: list[CaptureLink] = Field(default_factory=list)
+    subject: SubjectInfo | None = None
 
 
 class SearchResult(BaseModel):

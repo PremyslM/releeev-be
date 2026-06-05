@@ -5,11 +5,11 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any
+from dataclasses import dataclass, field
 
 from src import queries as Q
 from src.config import settings
-from src.models import CaptureLink, ExtractedAttributes, LinkedCapture, LinkType
+from src.models import ExtractedAttributes, LinkedCapture, LinkType
 from src.neo4j_driver import get_session
 
 logger = logging.getLogger(__name__)
@@ -118,6 +118,113 @@ def calculateLinkStrength(
     return round(min(1.0, max(0.0, score)), 4)
 
 
+# ── Evidence accumulation model ────────────────────────────────────────────────
+#
+# Instead of letting each signal compete and keeping a single "winning" link
+# type, we collect ALL evidence for each candidate pair and combine it into one
+# confidence score. The key benefit: several *weak* signals add up to a *strong*
+# link. Two captures that share only a category (weak) but were also taken at the
+# same place and in the same session (future iOS signals) become a confident link
+# — something no single-signal model could express.
+
+@dataclass
+class _Evidence:
+    """All accumulated signals for one candidate capture (the 'other' side)."""
+    capture_id: str
+    title: str = ""
+    summary: str = ""
+
+    # Content signals (available today)
+    embedding_sim: float = 0.0           # Neo4j vector score (0 if below threshold)
+    specific_topics: list[str] = field(default_factory=list)  # meaningful shared topics
+    shared_domain: str | None = None     # shared broad category (weak)
+    shared_entities: list[str] = field(default_factory=list)  # shared person/place/brand
+
+    # Contextual signals (filled once the iOS app captures geo / time / source).
+    # Wired in here so adding them later is a data change, not an engine rewrite.
+    same_place: bool = False             # captured at the same venue (~100 m)
+    same_session: bool = False           # captured within minutes of each other
+    same_source: bool = False            # same website domain / author
+
+
+# Tunable weights. Each signal independently contributes to the 0..1 score.
+# Calibrated so that:
+#   • domain-only            → ~0.30  (weak / secondary tier in UI)
+#   • ≥1 specific topic       → ≥0.40  (strong / primary tier)
+#   • near-duplicate          → ~similarity (≈0.9)
+#   • weak signals stack      → can cross into the strong tier together
+_W = {
+    "topic_base":   0.40, "topic_extra": 0.10, "topic_cap": 0.65,
+    "entity_base":  0.30, "entity_extra": 0.10, "entity_cap": 0.55,
+    "domain_only":  0.30, "domain_corrob": 0.10,
+    "embedding":    0.20,
+    "place":        0.30, "session": 0.20, "source": 0.25,  # future iOS signals
+    "near_dup":     0.80,
+}
+
+
+def _score_evidence(ev: _Evidence, threshold: float) -> tuple[float, LinkType, list[str]]:
+    """
+    Combine all of a candidate's evidence into (confidence, display_type, reasons).
+
+    `reasons` is a human-readable explanation list shown in the UI ("proč").
+    """
+    score = 0.0
+    reasons: list[str] = []
+
+    # 1. Specific shared topics — strongest content signal
+    if ev.specific_topics:
+        n = len(ev.specific_topics)
+        score += min(_W["topic_cap"], _W["topic_base"] + _W["topic_extra"] * (n - 1))
+        reasons.append("témata: " + ", ".join(ev.specific_topics[:3]))
+
+    # 2. Shared specific entities (person / brand / specific place)
+    if ev.shared_entities:
+        n = len(ev.shared_entities)
+        score += min(_W["entity_cap"], _W["entity_base"] + _W["entity_extra"] * (n - 1))
+        reasons.append("entity: " + ", ".join(ev.shared_entities[:3]))
+
+    # 3. Shared broad category — weak on its own, light corroboration otherwise
+    if ev.shared_domain:
+        score += _W["domain_corrob"] if ev.specific_topics else _W["domain_only"]
+        reasons.append(f"kategorie: {ev.shared_domain}")
+
+    # 4. Embedding similarity — corroborating signal, scaled above the threshold
+    if ev.embedding_sim > 0:
+        norm = max(0.0, min(1.0, (ev.embedding_sim - threshold) / max(1e-6, 1.0 - threshold)))
+        score += _W["embedding"] * norm
+        if norm > 0.4:
+            reasons.append("významová podobnost")
+
+    # 5. Contextual signals from the iOS app (place / time / source)
+    if ev.same_place:
+        score += _W["place"];   reasons.append("stejné místo")
+    if ev.same_session:
+        score += _W["session"]; reasons.append("stejná chvíle")
+    if ev.same_source:
+        score += _W["source"];  reasons.append("stejný zdroj")
+
+    # 6. Near-duplicate floor — almost-identical captures are strong on their own
+    if ev.embedding_sim >= _W["near_dup"]:
+        score = max(score, ev.embedding_sim)
+        if not reasons:
+            reasons.append("téměř duplikát")
+
+    score = min(1.0, score)
+
+    # Pick the dominant link type for the icon/label (display only)
+    if ev.same_place or ev.same_session:
+        display = LinkType.temporal_proximity        # contextual (place/time)
+    elif ev.shared_entities:
+        display = LinkType.entity_match
+    elif ev.specific_topics:
+        display = LinkType.topic_overlap
+    else:
+        display = LinkType.embedding_similarity      # domain-only / near-dup
+
+    return score, display, reasons
+
+
 # ── Graph queries ─────────────────────────────────────────────────────────────
 
 async def findSimilarCaptures(
@@ -128,157 +235,109 @@ async def findSimilarCaptures(
     limit: int = 10,
 ) -> list[LinkedCapture]:
     """
-    Run all four Cypher similarity queries in sequence and merge results,
-    de-duplicating by capture_id and keeping the highest-strength link per pair.
+    Gather evidence from every available signal, combine it per candidate into a
+    single confidence score, and return the strongest links.
+
+    This is the 'evidence accumulation' model: signals don't compete (as in the
+    old priority-based merge) — they add up. A pair sharing only a category is a
+    weak link; the same pair sharing a category AND captured together becomes a
+    strong one.
     """
     threshold = settings.cosine_similarity_threshold
-    days      = settings.temporal_proximity_days
-    results: dict[str, LinkedCapture] = {}
+    evidence: dict[str, _Evidence] = {}
+
+    def _ev(cid: str, row) -> _Evidence:
+        e = evidence.get(cid)
+        if e is None:
+            e = _Evidence(
+                capture_id=cid,
+                title=row.get("title", "") or "",
+                summary=row.get("summary", "") or "",
+            )
+            evidence[cid] = e
+        return e
 
     async with get_session() as session:
 
-        # 1. Embedding similarity — WITH topic corroboration + domain tiering.
-        #
-        # Pure embedding similarity is noisy: all Czech e-shop product pages
-        # (cars, watches, clothing) look alike because they share the same
-        # "product page, price in Kč incl. VAT" structure. A Subaru listing is
-        # 0.71 similar to a *watch*. So embedding score alone is unreliable.
-        #
-        # We classify each candidate by what kind of topics it shares:
-        #   • shares a SPECIFIC topic  → STRONG link  (strength = similarity)
-        #   • shares only a DOMAIN tag → WEAK  link  (strength ≈ 0.30, secondary)
-        #   • shares nothing           → dropped, unless near-duplicate
-        NEAR_DUPLICATE = 0.80  # Neo4j-scaled score; above this, always link
-        WEAK_DOMAIN_STRENGTH = 0.30  # below UI primary threshold → "slabší vazby"
+        # ── Signal A: embedding similarity (vector index) ───────────────────────
         try:
             rec = await session.run(
                 Q.EMBEDDING_SIMILARITY,
                 capture_id=capture_id,
                 embedding=embedding,
-                k=limit * 2,
+                k=limit * 3,
                 threshold=threshold,
             )
             async for row in rec:
-                sim = row["similarity"]
-                names = row.get("shared_names") or []
-                # Specific = meaningful content topic (not generic, not a domain tag)
-                specific = [n for n in names if _is_meaningful(n)]
-                domain   = [n for n in names if n and n.lower() in DOMAIN_TOPICS]
-
-                if specific:
-                    # Genuine content overlap → strong semantic link
-                    _merge(results, row, LinkType.embedding_similarity, sim)
-                elif domain:
-                    # Only a broad category in common → weak "smaller" link
-                    _merge(results, row, LinkType.embedding_similarity, WEAK_DOMAIN_STRENGTH)
-                elif sim >= NEAR_DUPLICATE:
-                    # No shared topics but nearly identical → near-duplicate
-                    _merge(results, row, LinkType.embedding_similarity, sim)
-                else:
-                    logger.debug(
-                        "Skipping embedding link %s (sim=%.3f, no shared topics — structural coincidence)",
-                        (row.get("title") or "")[:40], sim,
-                    )
+                e = _ev(row["capture_id"], row)
+                e.embedding_sim = float(row["similarity"])
         except Exception as exc:  # noqa: BLE001
             logger.warning("Embedding similarity query failed: %s", exc)
 
-        # 2. Topic overlap — require ≥ 2 shared *meaningful* topics
-        # (generic terms like "online shopping" are filtered out first)
+        # ── Signal B: shared topics (specific) + shared domain (category) ───────
+        # TOPIC_OVERLAP returns every pair sharing ≥1 topic, including pairs whose
+        # embedding is below threshold — so this is the authoritative topic source.
         try:
             rec = await session.run(
                 Q.TOPIC_OVERLAP,
                 capture_id=capture_id,
-                limit=limit * 2,
+                limit=limit * 4,
             )
             async for row in rec:
-                meaningful = [n for n in (row.get("shared_names") or []) if _is_meaningful(n)]
-                if len(meaningful) < 2:
-                    continue  # 1 or 0 specific topics is not a strong thematic link
-                # 2 shared → 0.40,  5 shared → 1.0
-                strength = min(1.0, len(meaningful) / 5)
-                _merge(results, row, LinkType.topic_overlap, strength)
+                names = row.get("shared_names") or []
+                specific = [n for n in names if _is_meaningful(n)]
+                domain   = next((n.lower() for n in names if n and n.lower() in DOMAIN_TOPICS), None)
+                if not specific and not domain:
+                    continue
+                e = _ev(row["capture_id"], row)
+                e.specific_topics = specific
+                if domain:
+                    e.shared_domain = domain
         except Exception as exc:
             logger.warning("Topic overlap query failed: %s", exc)
 
-        # 3. Entity match — require a shared *specific* person/place.
-        # Generic places like "Czech Republic" are filtered so that every
-        # Czech screenshot doesn't link to every other one.
+        # ── Signal C: shared specific entities (person / place / brand) ─────────
         try:
             rec = await session.run(
                 Q.ENTITY_MATCH,
                 capture_id=capture_id,
-                limit=limit * 2,
+                limit=limit * 3,
             )
             async for row in rec:
                 ents = [n for n in (row.get("shared_entities") or []) if _is_meaningful(n)]
                 if not ents:
                     continue
-                strength = min(1.0, len(ents) / 2)
-                _merge(results, row, LinkType.entity_match, strength)
+                e = _ev(row["capture_id"], row)
+                e.shared_entities = ents
         except Exception as exc:
             logger.warning("Entity match query failed: %s", exc)
 
-        # NOTE: Temporal proximity is intentionally skipped.
-        # "Uploaded on the same day" is not a meaningful semantic connection,
-        # especially when all captures come from one batch upload session.
-        # It can be re-enabled once the dataset grows and date-based context
-        # becomes genuinely informative.
+        # ── Signals D/E/F: place / session / source (future iOS data) ───────────
+        # When the iOS app starts capturing geo, timestamps and shared-URL
+        # metadata, populate e.same_place / e.same_session / e.same_source here
+        # (e.g. via CO_LOCATED / SAME_SESSION / SAME_SOURCE Cypher queries).
+        # The scoring function already accounts for them.
 
-    # Filter by minimum strength and cap results.
-    # Floor is 0.25 so weak domain-level links (strength ~0.30) survive and
-    # appear in the UI's collapsible "slabší vazby" (smaller connections) tier.
+    # Combine evidence → confidence score per candidate
     min_strength = settings.link_strength_min
-    sorted_links = sorted(
-        (v for v in results.values() if v.strength >= min_strength),
-        key=lambda x: x.strength,
-        reverse=True,
-    )
-    return sorted_links[:limit]
-
-
-def _merge(
-    acc: dict[str, LinkedCapture],
-    row: Any,
-    link_type: LinkType,
-    strength: float,
-) -> None:
-    """
-    Insert or upgrade an entry in the accumulator dict.
-
-    Priority order (highest = preferred):
-        4 — embedding_similarity   (semantic content match)
-        3 — topic_overlap          (shared topics)
-        2 — entity_match           (shared people/places)
-        1 — temporal_proximity     (fallback)
-
-    Within the same priority level, higher strength wins.
-    """
-    _PRIORITY = {
-        LinkType.embedding_similarity: 4,
-        LinkType.topic_overlap: 3,
-        LinkType.entity_match: 2,
-        LinkType.temporal_proximity: 1,
-    }
-
-    cid = row["capture_id"]
-    existing = acc.get(cid)
-
-    if existing is None:
-        pass  # will be set below
-    else:
-        ep = _PRIORITY.get(existing.link_type, 0)
-        np = _PRIORITY.get(link_type, 0)
-        # Keep existing if it has higher priority, or same priority + higher strength
-        if ep > np or (ep == np and existing.strength >= strength):
-            return
-
-    acc[cid] = LinkedCapture(
-            capture_id=cid,
-            link_type=link_type,
-            strength=round(strength, 4),
-            title=row.get("title", ""),
-            summary=row.get("summary", ""),
+    links: list[LinkedCapture] = []
+    for e in evidence.values():
+        score, display_type, reasons = _score_evidence(e, threshold)
+        if score < min_strength:
+            continue
+        links.append(
+            LinkedCapture(
+                capture_id=e.capture_id,
+                link_type=display_type,
+                strength=round(score, 4),
+                title=e.title,
+                summary=e.summary,
+                reasons=reasons,
+            )
         )
+
+    links.sort(key=lambda x: x.strength, reverse=True)
+    return links[:limit]
 
 
 # ── Persist links ─────────────────────────────────────────────────────────────
@@ -298,5 +357,6 @@ async def persistLinks(
                 target_id=link.capture_id,
                 link_type=link.link_type.value,
                 strength=link.strength,
+                reasons=link.reasons,
             )
     logger.info("Persisted %d links from %s", len(links), source_id)

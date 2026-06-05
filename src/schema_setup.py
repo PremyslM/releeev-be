@@ -20,6 +20,8 @@ CONSTRAINTS = [
     "CREATE CONSTRAINT topic_name IF NOT EXISTS FOR (n:Topic)   REQUIRE n.name IS UNIQUE",
     "CREATE CONSTRAINT person_name IF NOT EXISTS FOR (n:Person)  REQUIRE n.name IS UNIQUE",
     "CREATE CONSTRAINT place_name  IF NOT EXISTS FOR (n:Place)   REQUIRE n.name IS UNIQUE",
+    # A Subject groups captures of the same real-world thing (product/person/…)
+    "CREATE CONSTRAINT subject_id  IF NOT EXISTS FOR (n:Subject) REQUIRE n.id IS UNIQUE",
 ]
 
 # ── Indexes ───────────────────────────────────────────────────────────────────
