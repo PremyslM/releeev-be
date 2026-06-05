@@ -152,3 +152,36 @@ def getEmbedding(text: str) -> list[float]:
     except Exception as exc:  # noqa: BLE001
         logger.error("getEmbedding failed: %s", exc)
         return [0.0] * 1024
+
+
+def getEmbeddingsBatch(texts: list[str]) -> list[list[float]]:
+    """
+    Embed many texts in a SINGLE Voyage API request.
+
+    The Voyage free tier is limited to 3 requests/minute, so embedding captures
+    one-by-one quickly hits the rate limit. Batching all texts into one call
+    avoids that entirely (one request, regardless of how many texts).
+
+    Returns a list of 1024-dim vectors aligned with the input order.
+    Empty/blank inputs get a zero-vector; on total failure all are zero-vectors.
+    """
+    if not texts:
+        return []
+
+    # Replace blank texts with a single space (Voyage rejects empty strings)
+    safe = [t if t.strip() else " " for t in texts]
+
+    try:
+        vc = _voyage()
+        result = vc.embed(
+            texts=safe,
+            model="voyage-3",
+            input_type="document",
+        )
+        out: list[list[float]] = []
+        for i, emb in enumerate(result.embeddings):
+            out.append([0.0] * 1024 if not texts[i].strip() else emb)
+        return out
+    except Exception as exc:  # noqa: BLE001
+        logger.error("getEmbeddingsBatch failed (%d texts): %s", len(texts), exc)
+        return [[0.0] * 1024 for _ in texts]

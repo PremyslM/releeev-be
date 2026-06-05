@@ -14,6 +14,42 @@ from src.neo4j_driver import get_session
 
 logger = logging.getLogger(__name__)
 
+# Controlled vocabulary of broad domain/category tags.
+# These are assigned during topic extraction and used to create *weak*
+# category-level links (e.g. Subaru ↔ Tesla = both 'automotive') that pure
+# specific-topic matching would miss. Kept lowercase for case-insensitive match.
+DOMAIN_TOPICS = {
+    # vehicles & tech
+    "automotive", "programming", "electronics", "computers", "mobile",
+    "gaming", "photography",
+    # home & living
+    "appliances", "furniture", "home", "kitchen", "tools", "garden",
+    # personal & style
+    "fashion", "watches", "jewelry", "beauty", "health", "sports",
+    # lifestyle & media
+    "food", "travel", "music", "entertainment", "books", "movies",
+    # knowledge & money
+    "finance", "education", "office", "toys", "pets", "baby",
+}
+
+# Generic terms that appear across unrelated captures (e-commerce boilerplate,
+# country names) and must NOT count as meaningful shared topics or entities.
+# Without this filter, every Czech product page links to every other one via
+# "online shopping" / "Czech Republic". Compared case-insensitively.
+GENERIC_TERMS = {
+    "e-commerce", "ecommerce", "online shopping", "shopping", "product page",
+    "product listing", "listing", "website", "web page", "webpage", "online store",
+    "price", "pricing", "product", "retail", "purchase", "buy", "shop",
+    "czech republic", "czech", "czechia", "europe", "usa", "uk",
+    "internet", "online", "app", "application", "user interface", "ui",
+}
+
+
+def _is_meaningful(name: str) -> bool:
+    """True if a topic/entity name is specific enough to corroborate a link."""
+    n = (name or "").strip().lower()
+    return bool(n) and n not in GENERIC_TERMS and n not in DOMAIN_TOPICS
+
 # ── Math helpers ──────────────────────────────────────────────────────────────
 
 def cosineSimilarity(vec1: list[float], vec2: list[float]) -> float:
@@ -101,7 +137,19 @@ async def findSimilarCaptures(
 
     async with get_session() as session:
 
-        # 1. Embedding similarity (Neo4j vector index)
+        # 1. Embedding similarity — WITH topic corroboration + domain tiering.
+        #
+        # Pure embedding similarity is noisy: all Czech e-shop product pages
+        # (cars, watches, clothing) look alike because they share the same
+        # "product page, price in Kč incl. VAT" structure. A Subaru listing is
+        # 0.71 similar to a *watch*. So embedding score alone is unreliable.
+        #
+        # We classify each candidate by what kind of topics it shares:
+        #   • shares a SPECIFIC topic  → STRONG link  (strength = similarity)
+        #   • shares only a DOMAIN tag → WEAK  link  (strength ≈ 0.30, secondary)
+        #   • shares nothing           → dropped, unless near-duplicate
+        NEAR_DUPLICATE = 0.80  # Neo4j-scaled score; above this, always link
+        WEAK_DOMAIN_STRENGTH = 0.30  # below UI primary threshold → "slabší vazby"
         try:
             rec = await session.run(
                 Q.EMBEDDING_SIMILARITY,
@@ -111,25 +159,50 @@ async def findSimilarCaptures(
                 threshold=threshold,
             )
             async for row in rec:
-                _merge(results, row, LinkType.embedding_similarity, row["similarity"])
+                sim = row["similarity"]
+                names = row.get("shared_names") or []
+                # Specific = meaningful content topic (not generic, not a domain tag)
+                specific = [n for n in names if _is_meaningful(n)]
+                domain   = [n for n in names if n and n.lower() in DOMAIN_TOPICS]
+
+                if specific:
+                    # Genuine content overlap → strong semantic link
+                    _merge(results, row, LinkType.embedding_similarity, sim)
+                elif domain:
+                    # Only a broad category in common → weak "smaller" link
+                    _merge(results, row, LinkType.embedding_similarity, WEAK_DOMAIN_STRENGTH)
+                elif sim >= NEAR_DUPLICATE:
+                    # No shared topics but nearly identical → near-duplicate
+                    _merge(results, row, LinkType.embedding_similarity, sim)
+                else:
+                    logger.debug(
+                        "Skipping embedding link %s (sim=%.3f, no shared topics — structural coincidence)",
+                        (row.get("title") or "")[:40], sim,
+                    )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Embedding similarity query failed: %s", exc)
 
-        # 2. Topic overlap
+        # 2. Topic overlap — require ≥ 2 shared *meaningful* topics
+        # (generic terms like "online shopping" are filtered out first)
         try:
             rec = await session.run(
                 Q.TOPIC_OVERLAP,
                 capture_id=capture_id,
-                min_shared=1,
                 limit=limit * 2,
             )
             async for row in rec:
-                strength = min(1.0, row["shared_topics"] / 10)
+                meaningful = [n for n in (row.get("shared_names") or []) if _is_meaningful(n)]
+                if len(meaningful) < 2:
+                    continue  # 1 or 0 specific topics is not a strong thematic link
+                # 2 shared → 0.40,  5 shared → 1.0
+                strength = min(1.0, len(meaningful) / 5)
                 _merge(results, row, LinkType.topic_overlap, strength)
         except Exception as exc:
             logger.warning("Topic overlap query failed: %s", exc)
 
-        # 3. Entity match
+        # 3. Entity match — require a shared *specific* person/place.
+        # Generic places like "Czech Republic" are filtered so that every
+        # Czech screenshot doesn't link to every other one.
         try:
             rec = await session.run(
                 Q.ENTITY_MATCH,
@@ -137,26 +210,23 @@ async def findSimilarCaptures(
                 limit=limit * 2,
             )
             async for row in rec:
-                strength = min(1.0, row["entity_count"] / 5)
+                ents = [n for n in (row.get("shared_entities") or []) if _is_meaningful(n)]
+                if not ents:
+                    continue
+                strength = min(1.0, len(ents) / 2)
                 _merge(results, row, LinkType.entity_match, strength)
         except Exception as exc:
             logger.warning("Entity match query failed: %s", exc)
 
-        # 4. Temporal proximity
-        try:
-            rec = await session.run(
-                Q.TEMPORAL_PROXIMITY,
-                capture_id=capture_id,
-                days=days,
-                limit=limit * 2,
-            )
-            async for row in rec:
-                strength = max(0.0, 1.0 - row["days_apart"] / days)
-                _merge(results, row, LinkType.temporal_proximity, strength)
-        except Exception as exc:
-            logger.warning("Temporal proximity query failed: %s", exc)
+        # NOTE: Temporal proximity is intentionally skipped.
+        # "Uploaded on the same day" is not a meaningful semantic connection,
+        # especially when all captures come from one batch upload session.
+        # It can be re-enabled once the dataset grows and date-based context
+        # becomes genuinely informative.
 
-    # Filter by minimum strength and cap results
+    # Filter by minimum strength and cap results.
+    # Floor is 0.25 so weak domain-level links (strength ~0.30) survive and
+    # appear in the UI's collapsible "slabší vazby" (smaller connections) tier.
     min_strength = settings.link_strength_min
     sorted_links = sorted(
         (v for v in results.values() if v.strength >= min_strength),
@@ -172,11 +242,37 @@ def _merge(
     link_type: LinkType,
     strength: float,
 ) -> None:
-    """Insert or upgrade an entry in the accumulator dict."""
+    """
+    Insert or upgrade an entry in the accumulator dict.
+
+    Priority order (highest = preferred):
+        4 — embedding_similarity   (semantic content match)
+        3 — topic_overlap          (shared topics)
+        2 — entity_match           (shared people/places)
+        1 — temporal_proximity     (fallback)
+
+    Within the same priority level, higher strength wins.
+    """
+    _PRIORITY = {
+        LinkType.embedding_similarity: 4,
+        LinkType.topic_overlap: 3,
+        LinkType.entity_match: 2,
+        LinkType.temporal_proximity: 1,
+    }
+
     cid = row["capture_id"]
     existing = acc.get(cid)
-    if existing is None or strength > existing.strength:
-        acc[cid] = LinkedCapture(
+
+    if existing is None:
+        pass  # will be set below
+    else:
+        ep = _PRIORITY.get(existing.link_type, 0)
+        np = _PRIORITY.get(link_type, 0)
+        # Keep existing if it has higher priority, or same priority + higher strength
+        if ep > np or (ep == np and existing.strength >= strength):
+            return
+
+    acc[cid] = LinkedCapture(
             capture_id=cid,
             link_type=link_type,
             strength=round(strength, 4),

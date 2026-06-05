@@ -12,12 +12,12 @@ TOPIC_OVERLAP = """
 MATCH (c:Capture)-[:HAS_TOPIC]->(t:Topic)<-[:HAS_TOPIC]-(other:Capture)
 WHERE c.id = $capture_id
   AND other.id <> $capture_id
-WITH other, COUNT(t) AS shared_topics
-WHERE shared_topics >= $min_shared
+WITH other, collect(DISTINCT t.name) AS shared_names
 RETURN other.id            AS capture_id,
        other.title         AS title,
        other.summary       AS summary,
-       shared_topics,
+       shared_names,
+       size(shared_names)  AS shared_topics,
        'TOPIC_OVERLAP'     AS link_type
 ORDER BY shared_topics DESC
 LIMIT $limit
@@ -67,10 +67,18 @@ CALL db.index.vector.queryNodes(
 ) YIELD node AS other, score
 WHERE other.id <> $capture_id
   AND score >= $threshold
+WITH other, score
+// Count how many topics the two captures share — used for corroboration.
+// A high embedding score alone can be misleading (e.g. all e-shop product
+// pages look similar); requiring topic overlap keeps only meaningful links.
+OPTIONAL MATCH (src:Capture {id: $capture_id})-[:HAS_TOPIC]->(t:Topic)<-[:HAS_TOPIC]-(other)
+WITH other, score, collect(DISTINCT t.name) AS shared_names
 RETURN other.id            AS capture_id,
        other.title         AS title,
        other.summary       AS summary,
        score               AS similarity,
+       shared_names        AS shared_names,
+       size(shared_names)  AS shared_topics,
        'EMBEDDING_SIMILARITY' AS link_type
 ORDER BY score DESC
 """
@@ -127,7 +135,13 @@ SET   r.strength = $strength,
 
 GET_CAPTURE_BY_ID = """
 MATCH (c:Capture {id: $id})
-RETURN c
+OPTIONAL MATCH (c)-[:HAS_TOPIC]->(t:Topic)
+OPTIONAL MATCH (c)-[:MENTIONS]->(p:Person)
+OPTIONAL MATCH (c)-[:MENTIONS]->(pl:Place)
+RETURN c,
+       collect(DISTINCT t.name)  AS topics,
+       collect(DISTINCT p.name)  AS people,
+       collect(DISTINCT pl.name) AS places
 """
 
 GET_CAPTURE_BY_HASH = """
@@ -139,7 +153,14 @@ LIMIT 1
 
 GET_CAPTURE_CONNECTIONS = """
 MATCH (c:Capture {id: $id})-[r:LINKED_TO]-(other:Capture)
-RETURN c, r, other
+OPTIONAL MATCH (c)-[:HAS_TOPIC]->(t:Topic)<-[:HAS_TOPIC]-(other)
+RETURN r.type       AS link_type,
+       r.strength   AS strength,
+       other.id     AS other_id,
+       other.title  AS other_title,
+       other.summary AS other_summary,
+       collect(DISTINCT t.name) AS shared_topics
+ORDER BY r.strength DESC
 """
 
 FULLTEXT_SEARCH = """
@@ -168,16 +189,43 @@ LIMIT $limit
 """
 
 # ── Topic-based boost search ──────────────────────────────────────────────────
-# Finds Captures directly connected to a Topic that matches the query keyword
+# Finds Captures directly connected to a Topic that matches ANY of the given keywords
 TOPIC_BOOST_SEARCH = """
+UNWIND $keywords AS keyword
 MATCH (t:Topic)
-WHERE toLower(t.name) CONTAINS toLower($keyword)
+WHERE toLower(t.name) CONTAINS toLower(keyword)
 MATCH (c:Capture)-[:HAS_TOPIC]->(t)
 RETURN DISTINCT
        c.id       AS capture_id,
        c.title    AS title,
        c.summary  AS summary,
        c.created_at AS created_at,
-       1.5        AS score
+       0.4        AS score
 LIMIT $limit
+"""
+
+# ── Get all captures for re-embedding ────────────────────────────────────────
+GET_ALL_CAPTURES_FOR_REEMBED = """
+MATCH (c:Capture)
+RETURN c.id AS id, c.title AS title, c.summary AS summary,
+       c.embedding AS embedding
+ORDER BY c.created_at ASC
+"""
+
+UPDATE_EMBEDDING = """
+MATCH (c:Capture {id: $id})
+SET c.embedding = $embedding
+"""
+
+# ── Delete all LINKED_TO relationships (before full relink) ──────────────────
+DELETE_ALL_LINKS = """
+MATCH ()-[r:LINKED_TO]->()
+DELETE r
+"""
+
+# ── Get all captures with their embeddings (for relink) ──────────────────────
+GET_ALL_CAPTURES_FOR_RELINK = """
+MATCH (c:Capture)
+RETURN c.id AS id, c.embedding AS embedding
+ORDER BY c.created_at ASC
 """

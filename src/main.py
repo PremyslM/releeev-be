@@ -242,7 +242,7 @@ async def get_capture(capture_id: str) -> CaptureDetailResponse:
 
         node = record["c"]
 
-        # Parse attributes from flat node properties
+        # Parse attributes — topics/people/places come from related nodes in graph
         attrs = ExtractedAttributes(
             title=node.get("title", ""),
             summary=node.get("summary", ""),
@@ -250,6 +250,9 @@ async def get_capture(capture_id: str) -> CaptureDetailResponse:
             language=node.get("language", "en"),
             sentiment=node.get("sentiment", "neutral"),
             confidence=node.get("confidence", 1.0),
+            topics=[t for t in (record.get("topics") or []) if t],
+            people=[p for p in (record.get("people") or []) if p],
+            places=[pl for pl in (record.get("places") or []) if pl],
         )
         capture = CaptureNode(
             id=node["id"],
@@ -258,25 +261,38 @@ async def get_capture(capture_id: str) -> CaptureDetailResponse:
             embedding=list(node.get("embedding") or []),
         )
 
-        # Fetch connections
+        # Fetch connections with shared topics and other capture info
         conn_result = await session.run(Q.GET_CAPTURE_CONNECTIONS, id=capture_id)
-        connections: list[CaptureLink] = []
+        raw_connections: list[CaptureLink] = []
         async for row in conn_result:
-            rel = row["r"]
-            other = row["other"]
             try:
-                lt = LinkType(rel.get("type", "TOPIC_OVERLAP"))
+                lt = LinkType(row.get("link_type") or "TOPIC_OVERLAP")
             except ValueError:
                 lt = LinkType.topic_overlap
 
-            connections.append(
+            shared = [t for t in (row.get("shared_topics") or []) if t]
+
+            raw_connections.append(
                 CaptureLink(
                     source_id=capture_id,
-                    target_id=other["id"],
+                    target_id=row.get("other_id") or "",
                     link_type=lt,
-                    strength=float(rel.get("strength", 0.0)),
+                    strength=float(row.get("strength") or 0.0),
+                    other_title=row.get("other_title") or "",
+                    other_summary=row.get("other_summary") or "",
+                    shared_topics=shared,
                 )
             )
+
+        # Deprioritize temporal proximity — hide it if better links exist
+        has_better = any(
+            c.link_type != LinkType.temporal_proximity
+            for c in raw_connections
+        )
+        connections = [
+            c for c in raw_connections
+            if not (c.link_type == LinkType.temporal_proximity and has_better)
+        ]
 
     return CaptureDetailResponse(capture=capture, connections=connections)
 
@@ -349,15 +365,16 @@ async def search_captures(
 
     async with get_session() as session:
 
-        # ── Topic-based boost (exact / partial keyword match) ─────────────────
-        # Run for each word in the original query
-        for keyword in q.split():
-            if len(keyword) < 3:
-                continue
+        # ── Topic-based boost ────────────────────────────────────────────────
+        # Pass ALL keywords from both original query AND expansion at once
+        all_keywords = [w for w in effective_query.split(",") + effective_query.split()
+                        if len(w.strip()) >= 3]
+        all_keywords = list({k.strip() for k in all_keywords})  # deduplicate
+        if all_keywords:
             try:
                 rec = await session.run(
                     Q.TOPIC_BOOST_SEARCH,
-                    keyword=keyword,
+                    keywords=all_keywords,
                     limit=limit,
                 )
                 async for row in rec:
@@ -365,7 +382,7 @@ async def search_captures(
                     created_at = row["created_at"]
                     if hasattr(created_at, "to_native"):
                         created_at = created_at.to_native()
-                    boost_score = float(row["score"])  # 1.5 — topic exact match
+                    boost_score = float(row["score"])  # 1.5 — topic match
                     if cid not in seen or boost_score > seen[cid].score:
                         seen[cid] = SearchResult(
                             capture_id=cid,
@@ -386,29 +403,45 @@ async def search_captures(
                     k=limit * 2,
                     limit=limit,
                 )
+                sem_raw: dict[str, tuple] = {}  # cid → (score, row_data)
                 async for row in rec:
                     cid = row["capture_id"]
                     created_at = row["created_at"]
                     if hasattr(created_at, "to_native"):
                         created_at = created_at.to_native()
-                    sem_score = float(row["score"])
-                    # Add to topic-boosted score if already found, else set
-                    if cid in seen:
-                        seen[cid] = SearchResult(
-                            capture_id=cid,
-                            title=seen[cid].title,
-                            summary=seen[cid].summary,
-                            score=seen[cid].score + sem_score,  # combine
-                            created_at=seen[cid].created_at,
-                        )
-                    else:
-                        seen[cid] = SearchResult(
-                            capture_id=cid,
-                            title=row["title"] or "",
-                            summary=row["summary"] or "",
-                            score=sem_score,
-                            created_at=created_at,
-                        )
+                    sem_raw[cid] = (float(row["score"]), row, created_at)
+
+                # ── Relative normalization — spreads clustered scores ──────
+                if sem_raw:
+                    scores = [v[0] for v in sem_raw.values()]
+                    max_s, min_s = max(scores), min(scores)
+                    spread = max_s - min_s
+
+                    for cid, (raw_score, row, created_at) in sem_raw.items():
+                        # If all scores are clustered (spread < 0.05), normalize
+                        # so the best result gets 1.0, worst gets 0.0
+                        if spread > 0.001:
+                            sem_score = (raw_score - min_s) / spread
+                        else:
+                            # All nearly identical — keep small differences
+                            sem_score = raw_score
+
+                        if cid in seen:
+                            seen[cid] = SearchResult(
+                                capture_id=cid,
+                                title=seen[cid].title,
+                                summary=seen[cid].summary,
+                                score=seen[cid].score + sem_score,
+                                created_at=seen[cid].created_at,
+                            )
+                        else:
+                            seen[cid] = SearchResult(
+                                capture_id=cid,
+                                title=row["title"] or "",
+                                summary=row["summary"] or "",
+                                score=sem_score,
+                                created_at=created_at,
+                            )
             except Exception as exc:
                 logger.warning("Semantic search failed (non-fatal): %s", exc)
 
@@ -449,6 +482,295 @@ async def search_captures(
     results = sorted(seen.values(), key=lambda r: r.score, reverse=True)[:limit]
 
     return SearchResponse(query=q, results=results, total=len(results))
+
+
+# ── Re-extract topics from stored text (for captures with empty topics) ──────
+
+@app.post("/reanalyze-topics/{capture_id}", summary="Re-extract topics using Claude (text-only)")
+async def reanalyze_topics(capture_id: str):
+    """
+    Re-extracts topics, people, and places for a capture that has empty topics.
+    Uses Claude text API on the stored summary + raw_text — no image needed.
+    After updating topics, also rebuilds the embedding from the enriched text.
+    """
+    # Fetch existing capture
+    async with get_session() as session:
+        result = await session.run(Q.GET_CAPTURE_BY_ID, id=capture_id)
+        record = await result.single()
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"Capture '{capture_id}' not found")
+        node = record["c"]
+
+    title   = node.get("title", "") or ""
+    summary = node.get("summary", "") or ""
+    raw_text = node.get("raw_text", "") or ""
+
+    if not summary and not raw_text:
+        raise HTTPException(status_code=422, detail="No text content to analyze")
+
+    # Call Claude to extract structured attributes from text
+    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    prompt = f"""Extract structured metadata from this screenshot content. Return ONLY valid JSON, no explanation.
+
+Title: {title}
+Summary: {summary}
+Raw extracted text: {raw_text[:800]}
+
+Return JSON with:
+{{
+  "category": "<exactly ONE value from the allowed list below>",
+  "topics": ["<6-10 specific English topic keywords>"],
+  "people": ["<real person names mentioned, or []>"],
+  "places": ["<real place names or brands, or []>"]
+}}
+
+Allowed "category" values — pick the SINGLE best fit (coarse domain of the subject):
+automotive, programming, electronics, computers, mobile, gaming, photography,
+appliances, furniture, home, kitchen, tools, garden,
+fashion, watches, jewelry, beauty, health, sports,
+food, travel, music, entertainment, books, movies,
+finance, education, office, toys, pets, baby
+
+Category guidance (be CONSISTENT so similar items share a category):
+- Use the real-world domain of the SUBJECT, not the fact that it's a web page/shop.
+- ALL clothing, footwear, sportswear, apparel (shoes, sneakers, shorts, jackets) → "fashion"
+- "sports" ONLY for sports equipment, fitness gear, sporting events/content (not clothing)
+- Washing machine, oven, fridge, dishwasher, microwave → "appliances"
+- Laptop/phone/TV/camera → "electronics"; sofa/table/bed → "furniture"
+- Pick the closest match even if imperfect; this enables weak category-level links.
+
+Rules for topics:
+- Use canonical/standardized English terms so related captures share the same keywords
+- If content is clearly about a known brand/product, include it (e.g. 'Tesla', 'YouTube', 'Steam', 'Java')
+- Group synonyms: use 'electric vehicle' (not both 'electric car' AND 'electric vehicle')
+- 'Premium Long Range', WLTP range, rear-wheel drive pricing → almost certainly Tesla configurator → add topic 'Tesla'
+- Prefer specific over generic: 'Tesla Model 3' > 'car'; 'Java programming' > 'code'
+- Do NOT put the category word itself into topics — it is returned separately"""
+
+    try:
+        resp = client.messages.create(
+            model="claude-opus-4-8",
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw_json = next((b.text.strip() for b in resp.content if b.type == "text"), "{}")
+        # Strip markdown code fences if present
+        if raw_json.startswith("```"):
+            raw_json = raw_json.split("```")[1]
+            if raw_json.startswith("json"):
+                raw_json = raw_json[4:]
+        import json as _json
+        extracted = _json.loads(raw_json)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Claude extraction failed: {exc}") from exc
+
+    new_topics  = [t for t in extracted.get("topics", []) if isinstance(t, str)][:15]
+    new_people  = [p for p in extracted.get("people", []) if isinstance(p, str)][:10]
+    new_places  = [pl for pl in extracted.get("places", []) if isinstance(pl, str)][:10]
+
+    # Validate category against the controlled vocabulary; store as a Topic too
+    from src.link_engine import DOMAIN_TOPICS
+    category = (extracted.get("category") or "").strip().lower()
+    if category and category in DOMAIN_TOPICS:
+        # Add the domain tag as a topic so it participates in linking
+        if category not in [t.lower() for t in new_topics]:
+            new_topics.append(category)
+    else:
+        category = ""  # invalid / missing — skip
+
+    # Persist new topics/people/places to Neo4j
+    async with get_session() as session:
+        # Remove old HAS_TOPIC / MENTIONS relationships before re-adding
+        await session.run(
+            "MATCH (c:Capture {id: $id})-[r:HAS_TOPIC|MENTIONS]->() DELETE r",
+            id=capture_id,
+        )
+        for t in new_topics:
+            await session.run(Q.UPSERT_TOPIC,  name=t,  capture_id=capture_id)
+        for p in new_people:
+            await session.run(Q.UPSERT_PERSON, name=p,  capture_id=capture_id)
+        for pl in new_places:
+            await session.run(Q.UPSERT_PLACE,  name=pl, capture_id=capture_id)
+
+    # NOTE: Embedding is intentionally NOT recomputed here.
+    # The Voyage free tier allows only 3 requests/minute, so re-analyzing many
+    # captures in a row would hit the rate limit. Instead, call POST /reembed
+    # (which batches ALL texts into a single Voyage request) afterwards.
+    logger.info(
+        "Reanalyzed %s: category=%s, topics=%s, people=%s, places=%s",
+        capture_id[:8], category, new_topics, new_people, new_places,
+    )
+
+    return {
+        "capture_id": capture_id,
+        "category": category,
+        "topics":  new_topics,
+        "people":  new_people,
+        "places":  new_places,
+        "note": "Run POST /reembed to refresh embeddings (batched, avoids rate limit)",
+    }
+
+
+# ── Re-embed all captures (fixes zero embeddings from before Voyage AI key) ──
+
+@app.post("/reembed", summary="Recompute embeddings for all captures")
+async def reembed_all(force: bool = Query(default=False, description="Re-embed ALL, not just zero vectors")):
+    """
+    Recomputes Voyage AI embeddings for captures with zero/missing embeddings.
+
+    Uses a SINGLE batched Voyage request to avoid the free-tier 3 RPM rate limit
+    (embedding 12 captures one-by-one would otherwise fail after the first 3).
+
+    Pass ?force=true to re-embed every capture (e.g. after changing embed text).
+    """
+    async with get_session() as session:
+        result = await session.run(Q.GET_ALL_CAPTURES_FOR_REEMBED)
+        records = [r async for r in result]
+
+    # Collect captures that need (re)embedding
+    to_embed: list[tuple[str, str]] = []  # (capture_id, embed_text)
+    skipped = 0
+    for rec in records:
+        existing_emb = rec["embedding"] or []
+        has_valid = existing_emb and any(v != 0.0 for v in existing_emb[:10])
+        if has_valid and not force:
+            skipped += 1
+            continue
+        title   = rec["title"] or ""
+        summary = rec["summary"] or ""
+        to_embed.append((rec["id"], f"{title} {summary}"))
+
+    if not to_embed:
+        return {
+            "status": "done", "updated": 0, "skipped": skipped, "failed": 0,
+            "message": f"Nic k přepočtu (přeskočeno {skipped}).",
+        }
+
+    # ONE batched Voyage request for all texts
+    from src.vision_extractor import getEmbeddingsBatch
+    embeddings = getEmbeddingsBatch([t for _, t in to_embed])
+
+    updated = 0
+    failed = 0
+    async with get_session() as session:
+        for (cap_id, _), emb in zip(to_embed, embeddings):
+            if any(v != 0.0 for v in emb[:10]):
+                await session.run(Q.UPDATE_EMBEDDING, id=cap_id, embedding=emb)
+                updated += 1
+            else:
+                failed += 1
+
+    return {
+        "status": "done",
+        "updated": updated,
+        "skipped": skipped,
+        "failed": failed,
+        "message": f"Přepočítáno: {updated}, přeskočeno (OK): {skipped}, chyby: {failed}",
+    }
+
+
+# ── Relink all captures (recompute LINKED_TO with current engine settings) ───
+
+@app.post("/relink", summary="Delete all links and recompute them from scratch")
+async def relink_all():
+    """
+    Deletes every LINKED_TO relationship and recomputes links
+    using the current engine settings (thresholds, priority rules, etc.).
+
+    Use this after:
+    - Changing link strength thresholds
+    - Uploading new captures (to backfill links to old captures)
+    - Any change to link_engine.py logic
+    """
+    # Step 1: Delete all existing links
+    async with get_session() as session:
+        await session.run(Q.DELETE_ALL_LINKS)
+    logger.info("Deleted all existing LINKED_TO relationships")
+
+    # Step 2: Load all captures with their embeddings
+    async with get_session() as session:
+        result = await session.run(Q.GET_ALL_CAPTURES_FOR_RELINK)
+        records = [r async for r in result]
+
+    total_captures = len(records)
+    total_links = 0
+    failed = 0
+
+    # Step 3: For each capture, find similar and persist links
+    for rec in records:
+        cap_id = rec["id"]
+        embedding = list(rec["embedding"] or [])
+
+        # Skip captures without a valid embedding
+        if not embedding or not any(v != 0.0 for v in embedding[:10]):
+            logger.warning("Skipping capture %s — no valid embedding", cap_id[:8])
+            continue
+
+        try:
+            linked = await findSimilarCaptures(
+                cap_id,
+                ExtractedAttributes(),  # topics/people come from Neo4j directly
+                embedding,
+            )
+            if linked:
+                await persistLinks(cap_id, linked)
+                total_links += len(linked)
+                logger.info("Relinked %s → %d links", cap_id[:8], len(linked))
+        except Exception as exc:
+            logger.error("Relink failed for %s: %s", cap_id[:8], exc)
+            failed += 1
+
+    return {
+        "status": "done",
+        "captures_processed": total_captures,
+        "links_created": total_links,
+        "failed": failed,
+        "message": (
+            f"Zpracováno {total_captures} záznamů, "
+            f"vytvořeno {total_links} vazeb, "
+            f"chyby: {failed}"
+        ),
+    }
+
+
+# ── Graph data (for web UI visualization) ────────────────────────────────────
+
+@app.get("/graph-data", summary="All nodes + edges for graph visualization")
+async def get_graph_data():
+    """Returns all Capture nodes and LINKED_TO edges in vis-network format."""
+    nodes = []
+    edges = []
+
+    async with get_session() as session:
+        # All captures
+        result = await session.run(
+            "MATCH (c:Capture) "
+            "RETURN c.id AS id, c.title AS title, c.summary AS summary, "
+            "       c.created_at AS created_at"
+        )
+        async for rec in result:
+            nodes.append({
+                "id": rec["id"],
+                "label": (rec["title"] or "")[:35],
+                "title": (rec["summary"] or "")[:120],
+                "created_at": str(rec["created_at"]),
+            })
+
+        # All links
+        result = await session.run(
+            "MATCH (a:Capture)-[r:LINKED_TO]->(b:Capture) "
+            "RETURN a.id AS from_id, b.id AS to_id, "
+            "       r.strength AS strength, r.type AS link_type"
+        )
+        async for rec in result:
+            edges.append({
+                "from": rec["from_id"],
+                "to": rec["to_id"],
+                "value": float(rec["strength"] or 0.5),
+                "title": rec["link_type"] or "",
+            })
+
+    return {"nodes": nodes, "edges": edges}
 
 
 # ── Health check ──────────────────────────────────────────────────────────────

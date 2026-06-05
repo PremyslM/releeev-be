@@ -78,6 +78,10 @@ class CaptureLink(BaseModel):
     link_type: LinkType
     strength: float = Field(ge=0.0, le=1.0)
     meta: dict[str, Any] = Field(default_factory=dict)
+    # Denormalized for display — filled by GET /captures/{id}
+    other_title: str = ""
+    other_summary: str = ""
+    shared_topics: list[str] = Field(default_factory=list)
 
 
 # ── API request / response models ─────────────────────────────────────────────
