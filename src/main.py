@@ -860,8 +860,10 @@ def _clean_subject_title(title: str) -> str:
     """Strip source suffix / boilerplate to get a clean canonical Subject name."""
     s = title or ""
     # remove " on Alza.cz", " - mall.cz", " | shop.com" …
+    # The separator MUST be whitespace-delimited, otherwise "on" matches inside
+    # words like "iPh·on·e" and truncates the title to "iPh".
     s = _re.sub(
-        r"\s*(?:on|@|[-|–—])\s*[A-Za-z0-9.\- ]*\.(?:cz|com|sk|net|org|io|eu|de|shop|store)\b.*$",
+        r"\s+(?:on|@|via|[-|–—])\s+[A-Za-z0-9.\- ]*\.(?:cz|com|sk|net|org|io|eu|de|shop|store)\b.*$",
         "", s, flags=_re.I,
     )
     # remove trailing boilerplate words
