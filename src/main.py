@@ -8,10 +8,13 @@ Endpoints:
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import time
+from collections import defaultdict
 from contextlib import asynccontextmanager
+from functools import lru_cache
 
 import anthropic
 from fastapi import FastAPI, HTTPException, Query
@@ -343,7 +346,6 @@ def _expand_query_with_claude(q: str) -> str:
         expanded_text = next(
             (b.text.strip() for b in response.content if b.type == "text"), ""
         )
-        # Combine original + expanded terms
         combined = f"{q} {expanded_text.replace(',', ' ')}"
         logger.info("Query expanded: %r → %r", q, combined[:100])
         return combined
@@ -352,10 +354,41 @@ def _expand_query_with_claude(q: str) -> str:
         return q
 
 
+# ── Cached query helpers (the two slow network calls) ────────────────────────
+# Both are memoized: repeated/refined searches for the same text return instantly
+# instead of paying for another Claude / Voyage round-trip.
+
+@lru_cache(maxsize=512)
+def _expand_query_cached(q: str) -> str:
+    return _expand_query_with_claude(q)
+
+
+@lru_cache(maxsize=512)
+def _embed_query_cached(q: str) -> tuple[float, ...]:
+    """voyage-3 is multilingual — a Czech query embeds into the same space as
+    the English documents, so no translation is needed for semantic search."""
+    from src.vision_extractor import _voyage
+    vc = _voyage()
+    result = vc.embed(texts=[q], model="voyage-3", input_type="query")
+    return tuple(result.embeddings[0])
+
+
+def _to_native(dt):
+    return dt.to_native() if hasattr(dt, "to_native") else dt
+
+
+# Reciprocal Rank Fusion — combines several ranked lists into one robust ranking
+# without needing comparable score scales. score(d) = Σ w / (k + rank(d)).
+_RRF_K = 60
+_RRF_WEIGHTS = {"semantic": 1.0, "fulltext": 0.7, "topic": 1.3}
+_SEMANTIC_MIN = 0.45     # voyage query↔doc floor; below this is noise, not a match
+_MIN_RESULT_SCORE = 0.40  # drop results scoring below 40% of the top match
+
+
 @app.get(
     "/search",
     response_model=SearchResponse,
-    summary="Semantic + full-text search across captures (multilingual)",
+    summary="Hybrid search (semantic + fulltext + topic) with rank fusion",
 )
 async def search_captures(
     q: str = Query(..., min_length=1, description="Search query (any language)"),
@@ -364,145 +397,125 @@ async def search_captures(
     expand: bool = Query(default=True, description="Use Claude to expand/translate query"),
 ) -> SearchResponse:
     """
-    Multilingual search with Claude query expansion:
-    - Expands short queries (e.g. 'hra' → 'game gaming video game play')
-    - Combines semantic embedding search + fulltext
-    - Boosts captures that have exact Topic matches
+    Fast multilingual hybrid search:
+      1. Query embedding (Voyage, multilingual) and Claude expansion run in
+         PARALLEL, and both are cached — repeat searches are instant.
+      2. Semantic, fulltext and topic queries run CONCURRENTLY against Neo4j.
+      3. Results are merged with Reciprocal Rank Fusion (rank-based, robust to
+         incompatible score scales) for stable, precise ordering.
     """
-    seen: dict[str, SearchResult] = {}  # capture_id → best result
+    loop = asyncio.get_running_loop()
+    want_semantic = mode in ("semantic", "hybrid")
+    want_fulltext = mode in ("fulltext", "hybrid")
 
-    # ── Query expansion via Claude ────────────────────────────────────────────
-    effective_query = _expand_query_with_claude(q) if expand else q
+    # Kick off the query embedding immediately (cached; multilingual)
+    embed_fut = loop.run_in_executor(None, _embed_query_cached, q) if want_semantic else None
 
-    # ── Generate query embedding (for semantic / hybrid) ──────────────────────
+    meta: dict[str, dict] = {}          # cid → {title, summary, created_at}
+    ranked: dict[str, list[str]] = {}   # source → ordered capture_ids
+
+    def _keywords(text: str) -> list[str]:
+        return list({w.strip() for w in text.replace(",", " ").split() if len(w.strip()) >= 3})
+
+    async def _topic(keywords: list[str]) -> list[str]:
+        if not keywords:
+            return []
+        ids: list[str] = []
+        async with get_session() as s:
+            rec = await s.run(Q.TOPIC_BOOST_SEARCH, keywords=keywords, limit=limit * 2)
+            async for row in rec:
+                cid = row["capture_id"]
+                meta.setdefault(cid, {"title": row["title"] or "", "summary": row["summary"] or "",
+                                      "created_at": _to_native(row["created_at"])})
+                ids.append(cid)
+        return ids
+
+    # ── Conditional Claude expansion (only when actually needed) ──────────────
+    # English / topic-matching queries hit a Topic directly, so we skip Claude
+    # entirely (fast). Only a short query that matches NO topic — typically a
+    # cross-lingual miss like "programování" — pays for expansion+translation.
+    if want_fulltext:
+        topic_ids = await _topic(_keywords(q))
+        if expand and not topic_ids and len(q.split()) < 4:
+            expanded = await loop.run_in_executor(None, _expand_query_cached, q)
+            if expanded != q:
+                topic_ids = await _topic(_keywords(expanded))
+        ranked["topic"] = topic_ids
+
     query_embedding: list[float] = []
-    if mode in ("semantic", "hybrid"):
+    if embed_fut is not None:
         try:
-            from src.vision_extractor import _voyage
-            vc = _voyage()
-            result = vc.embed(texts=[effective_query], model="voyage-3", input_type="query")
-            query_embedding = result.embeddings[0]
+            query_embedding = list(await embed_fut)
         except Exception as exc:
-            logger.warning("Embedding for search query failed: %s", exc)
+            # e.g. Voyage rate limit — degrade gracefully to fulltext + topic
+            logger.warning("Query embedding unavailable, semantic skipped: %s", exc)
 
-    async with get_session() as session:
+    # ── Concurrent Neo4j queries (semantic + fulltext) ────────────────────────
+    async def _semantic() -> list[str]:
+        ids: list[str] = []
+        async with get_session() as s:
+            rec = await s.run(Q.SEMANTIC_SEARCH, embedding=query_embedding,
+                              k=limit * 3, limit=limit * 2)
+            async for row in rec:
+                if float(row["score"]) < _SEMANTIC_MIN:
+                    continue  # results are sorted desc → rest are noise too
+                cid = row["capture_id"]
+                meta.setdefault(cid, {"title": row["title"] or "", "summary": row["summary"] or "",
+                                      "created_at": _to_native(row["created_at"])})
+                ids.append(cid)
+        return ids
 
-        # ── Topic-based boost ────────────────────────────────────────────────
-        # Pass ALL keywords from both original query AND expansion at once
-        all_keywords = [w for w in effective_query.split(",") + effective_query.split()
-                        if len(w.strip()) >= 3]
-        all_keywords = list({k.strip() for k in all_keywords})  # deduplicate
-        if all_keywords:
-            try:
-                rec = await session.run(
-                    Q.TOPIC_BOOST_SEARCH,
-                    keywords=all_keywords,
-                    limit=limit,
-                )
-                async for row in rec:
-                    cid = row["capture_id"]
-                    created_at = row["created_at"]
-                    if hasattr(created_at, "to_native"):
-                        created_at = created_at.to_native()
-                    boost_score = float(row["score"])  # 1.5 — topic match
-                    if cid not in seen or boost_score > seen[cid].score:
-                        seen[cid] = SearchResult(
-                            capture_id=cid,
-                            title=row["title"] or "",
-                            summary=row["summary"] or "",
-                            score=boost_score,
-                            created_at=created_at,
-                        )
-            except Exception as exc:
-                logger.debug("Topic boost search failed: %s", exc)
+    async def _fulltext() -> list[str]:
+        ids: list[str] = []
+        async with get_session() as s:
+            rec = await s.run(Q.FULLTEXT_SEARCH, search_text=q, limit=limit * 2)
+            async for row in rec:
+                cid = row["capture_id"]
+                meta.setdefault(cid, {"title": row["title"] or "", "summary": row["summary"] or "",
+                                      "created_at": _to_native(row["created_at"])})
+                ids.append(cid)
+        return ids
 
-        # ── Semantic search ───────────────────────────────────────────────────
-        if mode in ("semantic", "hybrid") and query_embedding:
-            try:
-                rec = await session.run(
-                    Q.SEMANTIC_SEARCH,
-                    embedding=query_embedding,
-                    k=limit * 2,
-                    limit=limit,
-                )
-                sem_raw: dict[str, tuple] = {}  # cid → (score, row_data)
-                async for row in rec:
-                    cid = row["capture_id"]
-                    created_at = row["created_at"]
-                    if hasattr(created_at, "to_native"):
-                        created_at = created_at.to_native()
-                    sem_raw[cid] = (float(row["score"]), row, created_at)
+    tasks = {}
+    if want_semantic and query_embedding:
+        tasks["semantic"] = _semantic()
+    if want_fulltext:
+        tasks["fulltext"] = _fulltext()
 
-                # ── Relative normalization — spreads clustered scores ──────
-                if sem_raw:
-                    scores = [v[0] for v in sem_raw.values()]
-                    max_s, min_s = max(scores), min(scores)
-                    spread = max_s - min_s
+    if tasks:
+        done = await asyncio.gather(*tasks.values(), return_exceptions=True)
+        for source, result in zip(tasks.keys(), done):
+            if isinstance(result, Exception):
+                logger.warning("Search source %s failed: %s", source, result)
+                ranked[source] = []
+            else:
+                ranked[source] = result
 
-                    for cid, (raw_score, row, created_at) in sem_raw.items():
-                        # If all scores are clustered (spread < 0.05), normalize
-                        # so the best result gets 1.0, worst gets 0.0
-                        if spread > 0.001:
-                            sem_score = (raw_score - min_s) / spread
-                        else:
-                            # All nearly identical — keep small differences
-                            sem_score = raw_score
+    # ── Reciprocal Rank Fusion ────────────────────────────────────────────────
+    fused: dict[str, float] = defaultdict(float)
+    for source, ids in ranked.items():
+        w = _RRF_WEIGHTS.get(source, 1.0)
+        for rank, cid in enumerate(ids):
+            fused[cid] += w / (_RRF_K + rank)
 
-                        if cid in seen:
-                            seen[cid] = SearchResult(
-                                capture_id=cid,
-                                title=seen[cid].title,
-                                summary=seen[cid].summary,
-                                score=seen[cid].score + sem_score,
-                                created_at=seen[cid].created_at,
-                            )
-                        else:
-                            seen[cid] = SearchResult(
-                                capture_id=cid,
-                                title=row["title"] or "",
-                                summary=row["summary"] or "",
-                                score=sem_score,
-                                created_at=created_at,
-                            )
-            except Exception as exc:
-                logger.warning("Semantic search failed (non-fatal): %s", exc)
+    # Normalize to 0..1 and drop the low-relevance tail. For a short query the
+    # vector index returns *something* for every doc; RRF ranks them correctly
+    # but the bottom is noise (e.g. 100/99/75% real matches, then 26-32% junk).
+    # Keeping only results within 0.40 of the top yields a clean, precise list.
+    top = max(fused.values()) if fused else 1.0
+    ordered = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)
 
-        # ── Fulltext search ───────────────────────────────────────────────────
-        if mode in ("fulltext", "hybrid"):
-            try:
-                rec = await session.run(
-                    Q.FULLTEXT_SEARCH,
-                    search_text=q,
-                    limit=limit,
-                )
-                async for row in rec:
-                    cid = row["capture_id"]
-                    created_at = row["created_at"]
-                    if hasattr(created_at, "to_native"):
-                        created_at = created_at.to_native()
-                    ft_score = float(row["score"]) * 0.8
-                    if cid in seen:
-                        seen[cid] = SearchResult(
-                            capture_id=cid,
-                            title=seen[cid].title,
-                            summary=seen[cid].summary,
-                            score=seen[cid].score + ft_score,  # combine
-                            created_at=seen[cid].created_at,
-                        )
-                    else:
-                        seen[cid] = SearchResult(
-                            capture_id=cid,
-                            title=row["title"] or "",
-                            summary=row["summary"] or "",
-                            score=ft_score,
-                            created_at=created_at,
-                        )
-            except Exception as exc:
-                logger.warning("Fulltext search failed (non-fatal): %s", exc)
-
-    # Sort by score descending, return top `limit`
-    results = sorted(seen.values(), key=lambda r: r.score, reverse=True)[:limit]
-
+    results = [
+        SearchResult(
+            capture_id=cid,
+            title=meta[cid]["title"],
+            summary=meta[cid]["summary"],
+            score=round(score / top, 4),
+            created_at=meta[cid]["created_at"],
+        )
+        for cid, score in ordered
+        if (score / top) >= _MIN_RESULT_SCORE
+    ][:limit]
     return SearchResponse(query=q, results=results, total=len(results))
 
 

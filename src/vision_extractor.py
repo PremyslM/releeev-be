@@ -31,7 +31,9 @@ def _claude() -> anthropic.Anthropic:
 def _voyage() -> voyageai.Client:
     # Use VOYAGE_API_KEY if set, otherwise try ANTHROPIC_API_KEY
     key = settings.voyage_api_key or settings.anthropic_api_key
-    return voyageai.Client(api_key=key)
+    # max_retries=0: on the free tier's 3 RPM limit, fail fast (~100ms) instead
+    # of letting tenacity back-off for ~1.7s and blocking the search request.
+    return voyageai.Client(api_key=key, max_retries=0)
 
 
 # ── Extraction prompt ─────────────────────────────────────────────────────────
