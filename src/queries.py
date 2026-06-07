@@ -334,6 +334,50 @@ RETURN s.id AS subject_id, s.name AS subject_name, s.kind AS subject_kind
 LIMIT 1
 """
 
+# ── Entity navigation (browsable hubs) ───────────────────────────────────────
+
+LIST_TOPICS = """
+MATCH (t:Topic)<-[:HAS_TOPIC]-(c:Capture)
+RETURN t.name AS name, count(c) AS cnt
+ORDER BY cnt DESC, name ASC LIMIT $limit
+"""
+
+LIST_PEOPLE = """
+MATCH (p:Person)<-[:MENTIONS]-(c:Capture)
+RETURN p.name AS name, count(c) AS cnt
+ORDER BY cnt DESC, name ASC LIMIT $limit
+"""
+
+LIST_PLACES = """
+MATCH (pl:Place)<-[:MENTIONS]-(c:Capture)
+RETURN pl.name AS name, count(c) AS cnt
+ORDER BY cnt DESC, name ASC LIMIT $limit
+"""
+
+LIST_SUBJECTS = """
+MATCH (s:Subject)<-[:DEPICTS]-(c:Capture)
+RETURN s.name AS name, count(c) AS cnt
+ORDER BY cnt DESC, name ASC LIMIT $limit
+"""
+
+# Captures referencing a given entity. {label}/{rel} are injected from a
+# whitelist (topic→Topic/HAS_TOPIC, person/place→Person/Place/MENTIONS).
+ENTITY_CAPTURES_TMPL = """
+MATCH (e:{label} {{name: $name}})<-[:{rel}]-(c:Capture)
+RETURN c.id AS id, c.title AS title, c.summary AS summary
+ORDER BY c.created_at DESC
+LIMIT $limit
+"""
+
+# Entities co-occurring with the given one (shared captures) — for hopping.
+ENTITY_RELATED_TMPL = """
+MATCH (e:{label} {{name: $name}})<-[:{rel}]-(c:Capture)-[:HAS_TOPIC|MENTIONS]->(o)
+WHERE (o:Topic OR o:Person OR o:Place) AND o.name <> $name
+RETURN labels(o)[0] AS lbl, o.name AS name, count(DISTINCT c) AS cnt
+ORDER BY cnt DESC, name ASC
+LIMIT 15
+"""
+
 # ── Faceted search: fetch filterable fields for a set of candidate captures ──
 GET_CAPTURE_FACETS = """
 MATCH (c:Capture)

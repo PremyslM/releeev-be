@@ -33,6 +33,10 @@ from src.models import (
     ErrorResponse,
     ExtractedAttributes,
     LinkType,
+    EntityCapture,
+    EntityDetailResponse,
+    EntityListResponse,
+    EntityRef,
     SearchResponse,
     SearchResult,
     SubjectInfo,
@@ -332,6 +336,68 @@ async def get_capture(capture_id: str) -> CaptureDetailResponse:
             logger.debug("Subject lookup failed for %s: %s", capture_id[:8], exc)
 
     return CaptureDetailResponse(capture=capture, connections=connections, subject=subject)
+
+
+# ── Entity navigation (browsable hubs) ───────────────────────────────────────
+
+# Whitelisted label/relationship per entity kind (safe for string injection)
+_ENTITY_KIND = {
+    "topic":  ("Topic",  "HAS_TOPIC"),
+    "person": ("Person", "MENTIONS"),
+    "place":  ("Place",  "MENTIONS"),
+}
+_LABEL_TO_KIND = {"Topic": "topic", "Person": "person", "Place": "place"}
+
+
+@app.get("/entities", response_model=EntityListResponse,
+         summary="Browsable landmarks: most-referenced topics / people / places / subjects")
+async def list_entities(limit: int = Query(default=30, ge=1, le=200)) -> EntityListResponse:
+    """The 'spine' of navigation — top entities of each type, by capture count."""
+    async with get_session() as s:
+        async def _collect(query: str, kind: str) -> list[EntityRef]:
+            rec = await s.run(query, limit=limit)
+            return [EntityRef(name=r["name"], kind=kind, count=r["cnt"]) async for r in rec]
+
+        topics   = await _collect(Q.LIST_TOPICS, "topic")
+        people   = await _collect(Q.LIST_PEOPLE, "person")
+        places   = await _collect(Q.LIST_PLACES, "place")
+        subjects = await _collect(Q.LIST_SUBJECTS, "subject")
+
+    return EntityListResponse(topics=topics, people=people, places=places, subjects=subjects)
+
+
+@app.get("/entities/{kind}/{name}", response_model=EntityDetailResponse,
+         summary="A single entity's page: its captures + related entities to hop to")
+async def entity_detail(
+    kind: str, name: str,
+    limit: int = Query(default=50, ge=1, le=200),
+) -> EntityDetailResponse:
+    """Everything about one topic / person / place, plus co-occurring entities."""
+    kind = kind.lower()
+    if kind not in _ENTITY_KIND:
+        raise HTTPException(status_code=400, detail=f"Unknown entity kind '{kind}'")
+    label, rel = _ENTITY_KIND[kind]
+
+    captures_q = Q.ENTITY_CAPTURES_TMPL.format(label=label, rel=rel)
+    related_q  = Q.ENTITY_RELATED_TMPL.format(label=label, rel=rel)
+
+    async with get_session() as s:
+        rec = await s.run(captures_q, name=name, limit=limit)
+        captures = [
+            EntityCapture(capture_id=r["id"], title=r["title"] or "", summary=r["summary"] or "")
+            async for r in rec
+        ]
+        if not captures:
+            raise HTTPException(status_code=404, detail=f"{kind} '{name}' not found")
+
+        rec = await s.run(related_q, name=name)
+        related = [
+            EntityRef(name=r["name"], kind=_LABEL_TO_KIND.get(r["lbl"], "topic"), count=r["cnt"])
+            async for r in rec
+        ]
+
+    entity = EntityRef(name=name, kind=kind, count=len(captures))
+    return EntityDetailResponse(entity=entity, captures=captures, related=related)
 
 
 def _expand_query_with_claude(q: str) -> str:

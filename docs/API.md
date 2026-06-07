@@ -220,6 +220,53 @@ curl -s "http://localhost:8000/search?q=programov%C3%A1n%C3%AD&limit=5"
 
 ---
 
+## Navigace entit
+
+Procházení „podle věcí", ne podle záchytů — páteř navigace druhého mozku.
+
+### `GET /entities`
+
+Landmarks: nejčastější entity každého typu (pro rozcestník „Procházet").
+
+**Query:** `limit` (default 30, 1–200).
+
+**Response 200** — [`EntityListResponse`](#entitylistresponse)
+
+```json
+{
+  "topics":   [{ "name": "automotive", "kind": "topic", "count": 10 }],
+  "people":   [{ "name": "James May", "kind": "person", "count": 1 }],
+  "places":   [{ "name": "Czech Republic", "kind": "place", "count": 12 }],
+  "subjects": [{ "name": "Gorenje Washing Machine", "kind": "subject", "count": 3 }]
+}
+```
+
+### `GET /entities/{kind}/{name}`
+
+Stránka jedné entity: její záchyty + spoluvyskytující se entity (na proklik).
+
+**Path:** `kind` ∈ `topic` \| `person` \| `place`; `name` (URL-encoded).
+**Query:** `limit` (default 50).
+
+**Response 200** — [`EntityDetailResponse`](#entitydetailresponse)
+
+```json
+{
+  "entity": { "name": "automotive", "kind": "topic", "count": 10 },
+  "captures": [
+    { "capture_id": "…", "title": "Tesla Electric SUV …", "summary": "…" }
+  ],
+  "related": [
+    { "name": "electric vehicle", "kind": "topic", "count": 7 },
+    { "name": "Tesla", "kind": "topic", "count": 3 }
+  ]
+}
+```
+
+**Chyby:** `400` neznámý `kind` · `404` entita nenalezena.
+
+---
+
 ## Údržba & přepočty
 
 Tyto endpointy slouží k údržbě grafu po změnách dat nebo logiky. Jsou

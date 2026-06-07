@@ -154,6 +154,35 @@ class SearchResponse(BaseModel):
     facets: dict[str, dict[str, int]] = Field(default_factory=dict)
 
 
+# ── Entity navigation (browsable hubs) ──────────────────────────────────────────
+
+class EntityRef(BaseModel):
+    name: str
+    kind: str          # topic | person | place | subject
+    count: int = 0     # how many captures reference it
+
+
+class EntityListResponse(BaseModel):
+    """Landmarks for browsing — the most-referenced entities of each type."""
+    topics: list[EntityRef] = Field(default_factory=list)
+    people: list[EntityRef] = Field(default_factory=list)
+    places: list[EntityRef] = Field(default_factory=list)
+    subjects: list[EntityRef] = Field(default_factory=list)
+
+
+class EntityCapture(BaseModel):
+    capture_id: str
+    title: str = ""
+    summary: str = ""
+
+
+class EntityDetailResponse(BaseModel):
+    """A single entity's page: its captures + co-occurring entities to hop to."""
+    entity: EntityRef
+    captures: list[EntityCapture] = Field(default_factory=list)
+    related: list[EntityRef] = Field(default_factory=list)
+
+
 # ── Error model ────────────────────────────────────────────────────────────────
 
 class ErrorResponse(BaseModel):
