@@ -96,6 +96,17 @@ class AnalyzeCaptureRequest(BaseModel):
         default="image/jpeg",
         pattern=r"^image/(jpeg|png|webp|gif)$",
     )
+    # Optional capture location (from photo EXIF / device GPS, reverse-geocoded
+    # on the client). Turns a photo into a place-anchored memory.
+    lat: float | None = None
+    lon: float | None = None
+    place: str | None = None        # e.g. "Kavárna 14g"
+    locality: str | None = None     # e.g. "Mariánské Lázně"
+    captured_at: str | None = None  # real capture time (ISO), distinct from upload
+
+
+class AnalyzeUrlRequest(BaseModel):
+    url: str = Field(..., description="Webová adresa ke zpracování")
 
 
 class LinkedCapture(BaseModel):
@@ -130,10 +141,20 @@ class SubjectInfo(BaseModel):
     siblings: list[SubjectSibling] = Field(default_factory=list)
 
 
+class LocationInfo(BaseModel):
+    """Where a capture was made — the anchor for a place-based memory."""
+    lat: float
+    lon: float
+    place: str = ""
+    locality: str = ""
+    captured_at: str | None = None
+
+
 class CaptureDetailResponse(BaseModel):
     capture: CaptureNode
     connections: list[CaptureLink] = Field(default_factory=list)
     subject: SubjectInfo | None = None
+    location: LocationInfo | None = None
 
 
 class SearchResult(BaseModel):
@@ -142,6 +163,25 @@ class SearchResult(BaseModel):
     summary: str
     score: float
     created_at: datetime
+    category: str = ""        # domain (for the coloured dot / label)
+    capture_type: str = ""    # photo | document | note … (for the row icon)
+
+
+class AskSource(BaseModel):
+    """A capture cited in a RAG answer."""
+    n: int
+    capture_id: str
+    title: str = ""
+    category: str = ""
+    capture_type: str = ""
+    created_at: datetime | None = None
+
+
+class AskResponse(BaseModel):
+    """Answer synthesized strictly from the user's own captures, with citations."""
+    question: str
+    answer: str
+    sources: list[AskSource] = Field(default_factory=list)
 
 
 class SearchResponse(BaseModel):
@@ -181,6 +221,37 @@ class EntityDetailResponse(BaseModel):
     entity: EntityRef
     captures: list[EntityCapture] = Field(default_factory=list)
     related: list[EntityRef] = Field(default_factory=list)
+
+
+class LocationSummary(BaseModel):
+    """A place where captures were made — a memory hub."""
+    name: str
+    locality: str = ""
+    lat: float | None = None
+    lon: float | None = None
+    count: int = 0
+
+
+class LocationListResponse(BaseModel):
+    locations: list[LocationSummary] = Field(default_factory=list)
+
+
+# ── Auth ────────────────────────────────────────────────────────────────────────
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str = Field(min_length=6)
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class AuthResponse(BaseModel):
+    token: str
+    user_id: str
+    email: str
 
 
 # ── Error model ────────────────────────────────────────────────────────────────

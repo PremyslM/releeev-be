@@ -111,6 +111,36 @@ Claude API · `503` chyba databáze.
 
 ---
 
+### `POST /analyze-url`
+
+Druhá možnost nahrání (vedle obrázku): uživatel pošle **odkaz**. Server stáhne
+stránku, vytáhne obsah (title, OG meta, text), prožene Claudem a spustí stejný
+pipeline jako u obrázku — embedding, vazby, auto-zařazení do větve. `source` =
+doména, originální URL se uloží pro znovuotevření.
+
+Má **deduplikaci podle URL** — stejný odkaz vrátí existující záznam.
+
+**Request body** — [`AnalyzeUrlRequest`](#analyzeurlrequest)
+
+```json
+{ "url": "https://en.wikipedia.org/wiki/Tesla_Model_3" }
+```
+
+**Response 200** — [`AnalyzeCaptureResponse`](#analyzecaptureresponse) (`capture_type` = `document`).
+Detail záznamu (`GET /captures/{id}`) pak nese původní URL v `attributes.extra.url`.
+
+**Příklad**
+
+```bash
+curl -s -X POST http://localhost:8000/analyze-url \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://www.alza.cz/…"}'
+```
+
+**Chyby:** `400` stránku nelze načíst · `422` bez čitelného obsahu · `502` chyba Claude.
+
+---
+
 ### `GET /captures/{id}`
 
 Vrátí jeden záchyt včetně atributů, všech vazeb (s vysvětlením „proč") a — pokud

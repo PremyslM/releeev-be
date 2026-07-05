@@ -133,6 +133,80 @@ def extractAttributes(
     )
 
 
+def extractAttributesFromText(
+    text: str, url: str = "", signals: dict | None = None
+) -> ExtractedAttributes:
+    """
+    Build structured attributes from a web page's text (instead of an image).
+
+    Used by POST /analyze-url. Mirrors extractAttributes() but the input is the
+    page's text + HTML signals (title, OG tags) rather than pixels.
+    """
+    from src.link_engine import DOMAIN_TOPICS  # local import: avoids any cycle
+
+    client = _claude()
+    signals = signals or {}
+    sig_lines = "\n".join(f"{k}: {v}" for k, v in signals.items() if v)
+    allowed = ", ".join(sorted(DOMAIN_TOPICS))
+
+    prompt = f"""Analyse this web page and return ONLY valid JSON, no prose.
+
+URL: {url}
+{sig_lines}
+
+Page text (truncated):
+{text[:3500]}
+
+Return JSON:
+{{
+  "title":    "<concise descriptive title>",
+  "summary":  "<2-3 sentence summary of the page>",
+  "topics":   ["<6-10 specific English topic keywords>"],
+  "category": "<exactly ONE of: {allowed}>",
+  "people":   ["<real person names, or []>"],
+  "places":   ["<real place names / brands, or []>"],
+  "language": "<ISO-639-1 code>",
+  "sentiment":"<positive|negative|neutral>"
+}}
+
+Rules: canonical/standardized topics; specific over generic; do NOT put the
+category word itself into topics."""
+
+    resp = client.messages.create(
+        model="claude-opus-4-8",
+        max_tokens=800,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = next((b.text for b in resp.content if b.type == "text"), "{}").strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.error("URL attribute JSON parse failed: %s\nRaw: %s", exc, raw[:300])
+        data = {}
+
+    topics = [t for t in data.get("topics", []) if isinstance(t, str)][:15]
+    category = (data.get("category") or "").strip().lower()
+    if category in DOMAIN_TOPICS and category not in [t.lower() for t in topics]:
+        topics.append(category)
+
+    return ExtractedAttributes(
+        title=data.get("title", "") or (signals.get("og:title") or signals.get("page title") or url),
+        summary=data.get("summary", ""),
+        raw_text=text[:2000],
+        capture_type=CaptureType.document,
+        topics=topics,
+        people=[p for p in data.get("people", []) if isinstance(p, str)][:10],
+        places=[pl for pl in data.get("places", []) if isinstance(pl, str)][:10],
+        language=data.get("language", "en"),
+        sentiment=data.get("sentiment", "neutral"),
+        confidence=0.85,
+    )
+
+
 def getEmbedding(text: str) -> list[float]:
     """
     Generate a 1024-dimensional embedding vector using Voyage AI

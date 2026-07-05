@@ -17,16 +17,26 @@ from contextlib import asynccontextmanager
 from functools import lru_cache
 
 import anthropic
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from uuid import uuid4
+
 from src import queries as Q
+from src.auth import create_token, get_current_user, hash_password, verify_password
 from src.config import settings
 from src.link_engine import DOMAIN_TOPICS, findSimilarCaptures, persistLinks
 from src.models import (
     AnalyzeCaptureRequest,
     AnalyzeCaptureResponse,
+    AnalyzeUrlRequest,
+    AskResponse,
+    AskSource,
+    AuthResponse,
+    LoginRequest,
+    RegisterRequest,
+    LocationInfo,
     CaptureDetailResponse,
     CaptureLink,
     CaptureNode,
@@ -37,6 +47,8 @@ from src.models import (
     EntityDetailResponse,
     EntityListResponse,
     EntityRef,
+    LocationListResponse,
+    LocationSummary,
     SearchResponse,
     SearchResult,
     SubjectInfo,
@@ -44,7 +56,11 @@ from src.models import (
 )
 from src.neo4j_driver import close_driver, get_session
 from src.schema_setup import run_schema_setup
-from src.vision_extractor import extractAttributes, getEmbedding
+from src.vision_extractor import (
+    extractAttributes,
+    extractAttributesFromText,
+    getEmbedding,
+)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -113,13 +129,14 @@ async def generic_error_handler(request, exc: Exception):
 
 # ── Helper: persist a full capture to Neo4j ───────────────────────────────────
 
-async def _persist_capture(capture: CaptureNode) -> None:
+async def _persist_capture(capture: CaptureNode, user_id: str) -> None:
     attrs = capture.attributes
     async with get_session() as session:
-        # Upsert Capture node
+        # Upsert Capture node (owned by user_id)
         await session.run(
             Q.UPSERT_CAPTURE,
             id=capture.id,
+            user_id=user_id,
             title=attrs.title,
             summary=attrs.summary,
             raw_text=attrs.raw_text,
@@ -142,6 +159,54 @@ async def _persist_capture(capture: CaptureNode) -> None:
             await session.run(Q.UPSERT_PLACE, name=place, capture_id=capture.id)
 
 
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+@app.post("/auth/register", response_model=AuthResponse, summary="Create an account")
+async def register(req: RegisterRequest) -> AuthResponse:
+    email = req.email.strip().lower()
+    if "@" not in email or "." not in email:
+        raise HTTPException(status_code=400, detail="Neplatný e-mail.")
+    async with get_session() as session:
+        existing = await (await session.run(Q.GET_USER_BY_EMAIL, email=email)).single()
+        if existing is not None:
+            raise HTTPException(status_code=409, detail="Uživatel s tímto e-mailem už existuje.")
+        user_id = str(uuid4())
+        await session.run(
+            Q.CREATE_USER, id=user_id, email=email,
+            password_hash=hash_password(req.password),
+        )
+    return AuthResponse(token=create_token(user_id), user_id=user_id, email=email)
+
+
+@app.post("/auth/login", response_model=AuthResponse, summary="Log in")
+async def login(req: LoginRequest) -> AuthResponse:
+    email = req.email.strip().lower()
+    async with get_session() as session:
+        rec = await (await session.run(Q.GET_USER_BY_EMAIL, email=email)).single()
+    if rec is None or not verify_password(req.password, rec["password_hash"] or ""):
+        raise HTTPException(status_code=401, detail="Špatný e-mail nebo heslo.")
+    return AuthResponse(token=create_token(rec["id"]), user_id=rec["id"], email=email)
+
+
+@app.get("/auth/me", summary="Who am I (validates the token)")
+async def whoami(user_id: str = Depends(get_current_user)):
+    return {"user_id": user_id}
+
+
+@app.post("/auth/claim-orphans",
+          summary="One-time migration: assign all pre-auth captures to the current user")
+async def claim_orphans(user_id: str = Depends(get_current_user)):
+    """
+    Captures created before multi-user existed have no `user_id`. This assigns
+    every such orphan to the authenticated caller. Run once, from the account
+    that should own the existing data.
+    """
+    async with get_session() as session:
+        rec = await (await session.run(Q.CLAIM_ORPHAN_CAPTURES, user_id=user_id)).single()
+    claimed = rec["n"] if rec else 0
+    return {"claimed": claimed, "user_id": user_id}
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.post(
@@ -149,7 +214,10 @@ async def _persist_capture(capture: CaptureNode) -> None:
     response_model=AnalyzeCaptureResponse,
     summary="Upload image, extract attributes, find links",
 )
-async def analyze_capture(req: AnalyzeCaptureRequest) -> AnalyzeCaptureResponse:
+async def analyze_capture(
+    req: AnalyzeCaptureRequest,
+    user_id: str = Depends(get_current_user),
+) -> AnalyzeCaptureResponse:
     """
     1. Extract attributes via Claude Vision.
     2. Generate embedding via Voyage AI.
@@ -163,7 +231,7 @@ async def analyze_capture(req: AnalyzeCaptureRequest) -> AnalyzeCaptureResponse:
     # ── Deduplication — check if this exact image was already uploaded ────────
     image_hash = hashlib.sha256(req.image_base64.encode()).hexdigest()
     async with get_session() as session:
-        dup_result = await session.run(Q.GET_CAPTURE_BY_HASH, image_hash=image_hash)
+        dup_result = await session.run(Q.GET_CAPTURE_BY_HASH, image_hash=image_hash, uid=user_id)
         dup_record = await dup_result.single()
         if dup_record is not None:
             node = dup_record["c"]
@@ -210,10 +278,28 @@ async def analyze_capture(req: AnalyzeCaptureRequest) -> AnalyzeCaptureResponse:
 
     # ── Persist to Neo4j ──────────────────────────────────────────────────────
     try:
-        await _persist_capture(capture)
+        await _persist_capture(capture, user_id)
     except Exception as exc:
         logger.error("Neo4j persist error: %s", exc)
         raise HTTPException(status_code=503, detail=f"Database error: {exc}") from exc
+
+    # ── Capture location (place-anchored memory) ──────────────────────────────
+    if req.lat is not None and req.lon is not None:
+        try:
+            async with get_session() as session:
+                await session.run(
+                    Q.SET_CAPTURE_LOCATION, id=capture.id,
+                    lat=req.lat, lon=req.lon,
+                    place=req.place or "", locality=req.locality or "",
+                    captured_at=req.captured_at,
+                )
+                if req.place:
+                    await session.run(
+                        Q.UPSERT_LOCATION, id=capture.id, name=req.place,
+                        locality=req.locality or "", lat=req.lat, lon=req.lon,
+                    )
+        except Exception as exc:
+            logger.warning("Location persist failed (non-fatal): %s", exc)
 
     # ── Find similar captures ─────────────────────────────────────────────────
     try:
@@ -230,7 +316,7 @@ async def analyze_capture(req: AnalyzeCaptureRequest) -> AnalyzeCaptureResponse:
     try:
         subject_name = await _auto_group_on_upload(
             capture.id, attributes.title, attributes.summary,
-            attributes.raw_text, embedding,
+            attributes.raw_text, embedding, user_id,
         )
     except Exception as exc:
         logger.warning("Auto-group on upload failed (non-fatal): %s", exc)
@@ -247,16 +333,195 @@ async def analyze_capture(req: AnalyzeCaptureRequest) -> AnalyzeCaptureResponse:
     )
 
 
+# ── Analyze a URL (link upload) ───────────────────────────────────────────────
+
+def _parse_html(html: str) -> tuple[dict, str]:
+    """Extract title/OG/meta signals and a cleaned text dump from raw HTML."""
+    def meta(prop: str, attr: str = "property") -> str:
+        m = _re.search(
+            rf'<meta[^>]+{attr}=["\']{_re.escape(prop)}["\'][^>]+content=["\']([^"\']+)',
+            html, _re.I,
+        ) or _re.search(
+            rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+{attr}=["\']{_re.escape(prop)}["\']',
+            html, _re.I,
+        )
+        return m.group(1).strip() if m else ""
+
+    title_m = _re.search(r"<title[^>]*>(.*?)</title>", html, _re.I | _re.S)
+    signals = {
+        "page title": title_m.group(1).strip() if title_m else "",
+        "og:title": meta("og:title"),
+        "og:description": meta("og:description"),
+        "og:site_name": meta("og:site_name"),
+        "description": meta("description", attr="name"),
+    }
+
+    text = _re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", html, flags=_re.I | _re.S)
+    text = _re.sub(r"<[^>]+>", " ", text)
+    text = _re.sub(r"&(nbsp|amp|quot|#39|lt|gt);", " ", text)
+    text = _re.sub(r"\s+", " ", text).strip()
+    return signals, text
+
+
+_TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_adgroup", "utm_term",
+    "utm_content", "gclid", "gbraid", "wbraid", "gad_source", "gad_campaignid",
+    "tracking", "fbclid", "msclkid", "_ga", "mc_cid", "mc_eid",
+}
+
+
+def _strip_tracking(url: str) -> str:
+    """Drop ad/tracking query params so the same product = the same capture."""
+    from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+    p = urlsplit(url)
+    kept = [(k, v) for k, v in parse_qsl(p.query) if k.lower() not in _TRACKING_PARAMS]
+    return urlunsplit((p.scheme, p.netloc, p.path, urlencode(kept), ""))
+
+
+def _url_slug_text(url: str) -> str:
+    """Readable text from the URL path — fallback when the page can't be fetched.
+    'Apple-MacBook-Pro-14-M5-16GB-512GB-…' → 'Apple MacBook Pro 14 M5 16GB 512GB …'"""
+    from urllib.parse import urlsplit, unquote
+    segs = [s for s in unquote(urlsplit(url).path).split("/") if s]
+    slug = " ".join(segs[-2:]) if segs else ""
+    return _re.sub(r"\s+", " ", _re.sub(r"[-_+]+", " ", slug)).strip()
+
+
+async def _fetch_page(url: str) -> tuple[dict, str]:
+    """Fetch a page with realistic browser headers (avoids most bot-blocking 403s)."""
+    import httpx
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "cs-CZ,cs;q=0.9,en;q=0.8",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15.0, headers=headers) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return _parse_html(resp.text)
+
+
+@app.post("/analyze-url", response_model=AnalyzeCaptureResponse,
+          summary="Save a web link: fetch, extract, embed, link")
+async def analyze_url(
+    req: AnalyzeUrlRequest,
+    user_id: str = Depends(get_current_user),
+) -> AnalyzeCaptureResponse:
+    """
+    Second upload option (besides images): the user shares a URL.
+    Fetches the page, extracts content via Claude (text), then runs the SAME
+    pipeline as an image capture — embedding, linking, auto-grouping into a
+    Subject branch. The capture's `source` is the site domain and the original
+    URL is stored for one-tap reopening.
+    """
+    t0 = time.perf_counter()
+    url = req.url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    url = _strip_tracking(url)  # canonical: same product regardless of ad params
+    m = _re.search(r"https?://(?:www\.)?([^/]+)", url)
+    domain = (m.group(1) if m else "").lower()
+
+    # ── Dedup: same URL already saved? ────────────────────────────────────────
+    url_hash = hashlib.sha256(("url:" + url).encode()).hexdigest()
+    async with get_session() as session:
+        dup = await (await session.run(Q.GET_CAPTURE_BY_HASH, image_hash=url_hash, uid=user_id)).single()
+        if dup is not None:
+            node = dup["c"]
+            logger.info("Duplicate URL (%s) — returning existing capture", url[:60])
+            attrs = ExtractedAttributes(
+                title=node.get("title", ""), summary=node.get("summary", ""),
+                language=node.get("language", "en"),
+            )
+            return AnalyzeCaptureResponse(
+                capture_id=node["id"], attributes=attrs,
+                embedding_dim=len(node.get("embedding") or []),
+                processing_ms=int((time.perf_counter() - t0) * 1000),
+            )
+
+    # ── Fetch the page — with graceful fallback to the URL slug ───────────────
+    signals: dict = {}
+    text = ""
+    try:
+        signals, text = await _fetch_page(url)
+    except Exception as exc:
+        # Bot-blocking (403), timeouts, JS-only pages → derive from the URL slug.
+        # A product slug like "Apple-MacBook-Pro-14-M5-16GB-512GB" is informative.
+        logger.warning("Page fetch failed (%s) — falling back to URL slug", exc)
+
+    if not text and not any(signals.values()):
+        slug = _url_slug_text(url)
+        if not slug:
+            raise HTTPException(
+                status_code=400,
+                detail="Stránku se nepodařilo načíst a z adresy nelze nic odvodit.",
+            )
+        signals = {"url path": slug, "site": domain}
+        text = slug
+
+    # ── Extract attributes via Claude (text), then run the standard pipeline ──
+    try:
+        attributes = extractAttributesFromText(text, url, signals)
+    except anthropic.APIError as exc:
+        raise HTTPException(status_code=502, detail=f"Claude API error: {exc}") from exc
+
+    embed_text = f"{attributes.title} {attributes.summary} {' '.join(attributes.topics)}"
+    embedding = getEmbedding(embed_text)
+
+    capture = CaptureNode(image_hash=url_hash, attributes=attributes, embedding=embedding)
+    try:
+        await _persist_capture(capture, user_id)
+        async with get_session() as session:
+            await session.run(Q.SET_CAPTURE_URL, id=capture.id, url=url)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Database error: {exc}") from exc
+
+    try:
+        linked = await findSimilarCaptures(capture.id, attributes, embedding)
+        await persistLinks(capture.id, linked)
+    except Exception as exc:
+        logger.warning("Link engine error (non-fatal): %s", exc)
+        linked = []
+
+    subject_name = None
+    try:
+        subject_name = await _auto_group_on_upload(
+            capture.id, attributes.title, attributes.summary,
+            attributes.raw_text, embedding, user_id, source_hint=domain or None,
+        )
+    except Exception as exc:
+        logger.warning("Auto-group on upload failed (non-fatal): %s", exc)
+
+    return AnalyzeCaptureResponse(
+        capture_id=capture.id,
+        attributes=attributes,
+        embedding_dim=len(embedding),
+        linked_to=linked,
+        processing_ms=int((time.perf_counter() - t0) * 1000),
+        subject_name=subject_name,
+    )
+
+
 @app.get(
     "/captures/{capture_id}",
     response_model=CaptureDetailResponse,
     summary="Get a capture and all its connections",
 )
-async def get_capture(capture_id: str) -> CaptureDetailResponse:
+async def get_capture(
+    capture_id: str,
+    user_id: str = Depends(get_current_user),
+) -> CaptureDetailResponse:
     """Retrieve a single Capture node + all LINKED_TO relationships."""
     async with get_session() as session:
         # Fetch capture
-        result = await session.run(Q.GET_CAPTURE_BY_ID, id=capture_id)
+        result = await session.run(Q.GET_CAPTURE_BY_ID, id=capture_id, uid=user_id)
         record = await result.single()
         if record is None:
             raise HTTPException(status_code=404, detail=f"Capture '{capture_id}' not found")
@@ -274,6 +539,7 @@ async def get_capture(capture_id: str) -> CaptureDetailResponse:
             topics=[t for t in (record.get("topics") or []) if t],
             people=[p for p in (record.get("people") or []) if p],
             places=[pl for pl in (record.get("places") or []) if pl],
+            extra={"url": node["url"]} if node.get("url") else {},
         )
         capture = CaptureNode(
             id=node["id"],
@@ -335,27 +601,41 @@ async def get_capture(capture_id: str) -> CaptureDetailResponse:
         except Exception as exc:
             logger.debug("Subject lookup failed for %s: %s", capture_id[:8], exc)
 
-    return CaptureDetailResponse(capture=capture, connections=connections, subject=subject)
+        # Capture location (place-anchored memory), if present.
+        location = None
+        if node.get("lat") is not None and node.get("lon") is not None:
+            location = LocationInfo(
+                lat=float(node["lat"]), lon=float(node["lon"]),
+                place=node.get("place") or "", locality=node.get("locality") or "",
+                captured_at=node.get("captured_at"),
+            )
+
+    return CaptureDetailResponse(capture=capture, connections=connections,
+                                 subject=subject, location=location)
 
 
 # ── Entity navigation (browsable hubs) ───────────────────────────────────────
 
 # Whitelisted label/relationship per entity kind (safe for string injection)
 _ENTITY_KIND = {
-    "topic":  ("Topic",  "HAS_TOPIC"),
-    "person": ("Person", "MENTIONS"),
-    "place":  ("Place",  "MENTIONS"),
+    "topic":    ("Topic",    "HAS_TOPIC"),
+    "person":   ("Person",   "MENTIONS"),
+    "place":    ("Place",    "MENTIONS"),
+    "location": ("Location", "AT_LOCATION"),   # place-anchored memories
 }
-_LABEL_TO_KIND = {"Topic": "topic", "Person": "person", "Place": "place"}
+_LABEL_TO_KIND = {"Topic": "topic", "Person": "person", "Place": "place", "Location": "location"}
 
 
 @app.get("/entities", response_model=EntityListResponse,
          summary="Browsable landmarks: most-referenced topics / people / places / subjects")
-async def list_entities(limit: int = Query(default=30, ge=1, le=200)) -> EntityListResponse:
+async def list_entities(
+    limit: int = Query(default=30, ge=1, le=200),
+    user_id: str = Depends(get_current_user),
+) -> EntityListResponse:
     """The 'spine' of navigation — top entities of each type, by capture count."""
     async with get_session() as s:
         async def _collect(query: str, kind: str) -> list[EntityRef]:
-            rec = await s.run(query, limit=limit)
+            rec = await s.run(query, limit=limit, uid=user_id)
             return [EntityRef(name=r["name"], kind=kind, count=r["cnt"]) async for r in rec]
 
         topics   = await _collect(Q.LIST_TOPICS, "topic")
@@ -366,11 +646,30 @@ async def list_entities(limit: int = Query(default=30, ge=1, le=200)) -> EntityL
     return EntityListResponse(topics=topics, people=people, places=places, subjects=subjects)
 
 
+@app.get("/locations", response_model=LocationListResponse,
+         summary="Places where captures were made — memory hubs (with coordinates)")
+async def list_locations(
+    limit: int = Query(default=100, ge=1, le=500),
+    user_id: str = Depends(get_current_user),
+) -> LocationListResponse:
+    async with get_session() as s:
+        rec = await s.run(Q.LIST_LOCATIONS, limit=limit, uid=user_id)
+        locs = [
+            LocationSummary(
+                name=r["name"], locality=r["locality"] or "",
+                lat=r["lat"], lon=r["lon"], count=r["cnt"],
+            )
+            async for r in rec
+        ]
+    return LocationListResponse(locations=locs)
+
+
 @app.get("/entities/{kind}/{name}", response_model=EntityDetailResponse,
          summary="A single entity's page: its captures + related entities to hop to")
 async def entity_detail(
     kind: str, name: str,
     limit: int = Query(default=50, ge=1, le=200),
+    user_id: str = Depends(get_current_user),
 ) -> EntityDetailResponse:
     """Everything about one topic / person / place, plus co-occurring entities."""
     kind = kind.lower()
@@ -382,7 +681,7 @@ async def entity_detail(
     related_q  = Q.ENTITY_RELATED_TMPL.format(label=label, rel=rel)
 
     async with get_session() as s:
-        rec = await s.run(captures_q, name=name, limit=limit)
+        rec = await s.run(captures_q, name=name, limit=limit, uid=user_id)
         captures = [
             EntityCapture(capture_id=r["id"], title=r["title"] or "", summary=r["summary"] or "")
             async for r in rec
@@ -390,7 +689,7 @@ async def entity_detail(
         if not captures:
             raise HTTPException(status_code=404, detail=f"{kind} '{name}' not found")
 
-        rec = await s.run(related_q, name=name)
+        rec = await s.run(related_q, name=name, uid=user_id)
         related = [
             EntityRef(name=r["name"], kind=_LABEL_TO_KIND.get(r["lbl"], "topic"), count=r["cnt"])
             async for r in rec
@@ -479,6 +778,7 @@ async def search_captures(
     ctype: str | None = Query(default=None, alias="type", description="Filter by capture_type"),
     from_date: str | None = Query(default=None, alias="from", description="From date YYYY-MM-DD"),
     to_date: str | None = Query(default=None, alias="to", description="To date YYYY-MM-DD"),
+    user_id: str = Depends(get_current_user),
 ) -> SearchResponse:
     """
     Fast multilingual hybrid search:
@@ -506,7 +806,7 @@ async def search_captures(
             return []
         ids: list[str] = []
         async with get_session() as s:
-            rec = await s.run(Q.TOPIC_BOOST_SEARCH, keywords=keywords, limit=limit * 2)
+            rec = await s.run(Q.TOPIC_BOOST_SEARCH, keywords=keywords, limit=limit * 2, uid=user_id)
             async for row in rec:
                 cid = row["capture_id"]
                 meta.setdefault(cid, {"title": row["title"] or "", "summary": row["summary"] or "",
@@ -539,7 +839,7 @@ async def search_captures(
         ids: list[str] = []
         async with get_session() as s:
             rec = await s.run(Q.SEMANTIC_SEARCH, embedding=query_embedding,
-                              k=limit * 3, limit=limit * 2)
+                              k=limit * 3, limit=limit * 2, uid=user_id)
             async for row in rec:
                 if float(row["score"]) < _SEMANTIC_MIN:
                     continue  # results are sorted desc → rest are noise too
@@ -552,7 +852,7 @@ async def search_captures(
     async def _fulltext() -> list[str]:
         ids: list[str] = []
         async with get_session() as s:
-            rec = await s.run(Q.FULLTEXT_SEARCH, search_text=q, limit=limit * 2)
+            rec = await s.run(Q.FULLTEXT_SEARCH, search_text=q, limit=limit * 2, uid=user_id)
             async for row in rec:
                 cid = row["capture_id"]
                 meta.setdefault(cid, {"title": row["title"] or "", "summary": row["summary"] or "",
@@ -595,7 +895,7 @@ async def search_captures(
     facet_map: dict[str, dict] = {}
     if relevant:
         async with get_session() as s:
-            rec = await s.run(Q.GET_CAPTURE_FACETS, ids=[cid for cid, _ in relevant])
+            rec = await s.run(Q.GET_CAPTURE_FACETS, ids=[cid for cid, _ in relevant], uid=user_id)
             async for row in rec:
                 facet_map[row["id"]] = {
                     "language": (row["language"] or "").lower(),
@@ -658,16 +958,105 @@ async def search_captures(
             summary=meta[cid]["summary"],
             score=round(score / top, 4),
             created_at=meta[cid]["created_at"],
+            category=next((t for t in (facet_map.get(cid, {}).get("topics") or []) if t in DOMAIN_TOPICS), ""),
+            capture_type=(facet_map.get(cid, {}).get("capture_type") or ""),
         )
         for cid, score in final
     ][:limit]
     return SearchResponse(query=q, results=results, total=len(results), facets=facets)
 
 
+# ── Ask your brain (RAG, strictly grounded in your own captures) ─────────────
+
+def _ask_claude(question: str, context: str) -> str:
+    """Synthesize an answer ONLY from the provided captures, with [n] citations."""
+    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    system = (
+        "Jsi 'druhý mozek' uživatele — jeho osobní poznámky. Odpovídej VÝHRADNĚ "
+        "na základě poskytnutých zdrojů níže; nepřidávej žádné vnější znalosti. "
+        "Cituj zdroje značkou [n] přímo v textu tam, kde tvrzení pochází. Piš "
+        "stručně (2–5 vět), přirozeně, v jazyce otázky. Pokud zdroje odpověď "
+        "neobsahují, jasně to řekni a nic si nevymýšlej."
+    )
+    resp = client.messages.create(
+        model="claude-opus-4-8",
+        max_tokens=600,
+        system=system,
+        messages=[{"role": "user", "content": f"Otázka: {question}\n\nZdroje z mozku:\n{context}"}],
+    )
+    return next((b.text for b in resp.content if b.type == "text"), "").strip()
+
+
+@app.get("/ask", response_model=AskResponse,
+         summary="Answer a question strictly from your own captures, with citations")
+async def ask(
+    q: str = Query(..., min_length=1, description="Question for your second brain"),
+    limit: int = Query(default=6, ge=1, le=12),
+    user_id: str = Depends(get_current_user),
+) -> AskResponse:
+    loop = asyncio.get_running_loop()
+
+    # ── Retrieve relevant captures (semantic + fulltext, RRF) ─────────────────
+    try:
+        embedding = list(await loop.run_in_executor(None, _embed_query_cached, q))
+    except Exception as exc:
+        logger.warning("Ask: query embedding failed: %s", exc)
+        embedding = []
+
+    ranked: dict[str, list[str]] = {}
+    async with get_session() as s:
+        if embedding:
+            rec = await s.run(Q.SEMANTIC_SEARCH, embedding=embedding, k=limit * 4, limit=limit * 3, uid=user_id)
+            ranked["semantic"] = [r["capture_id"] async for r in rec if float(r["score"]) >= _SEMANTIC_MIN]
+        rec = await s.run(Q.FULLTEXT_SEARCH, search_text=q, limit=limit * 3, uid=user_id)
+        ranked["fulltext"] = [r["capture_id"] async for r in rec]
+
+    fused: dict[str, float] = defaultdict(float)
+    for source, ids in ranked.items():
+        w = _RRF_WEIGHTS.get(source, 1.0)
+        for rank, cid in enumerate(ids):
+            fused[cid] += w / (_RRF_K + rank)
+    top_ids = [cid for cid, _ in sorted(fused.items(), key=lambda kv: kv[1], reverse=True)[:limit]]
+
+    if not top_ids:
+        return AskResponse(question=q, answer="K tomuhle jsem v tvém mozku zatím nic nenašel.", sources=[])
+
+    # ── Build numbered context ────────────────────────────────────────────────
+    async with get_session() as s:
+        rec = await s.run(Q.GET_CAPTURES_FOR_ASK, ids=top_ids, uid=user_id)
+        rows = {r["id"]: r async for r in rec}
+    ordered = [rows[cid] for cid in top_ids if cid in rows]
+
+    all_sources: list[AskSource] = []
+    context_lines: list[str] = []
+    for i, r in enumerate(ordered, start=1):
+        category = next((t for t in (r["topics"] or []) if t in DOMAIN_TOPICS), "")
+        all_sources.append(AskSource(
+            n=i, capture_id=r["id"], title=r["title"] or "",
+            category=category, capture_type=r["capture_type"] or "",
+            created_at=_to_native(r["created_at"]),
+        ))
+        body = (r["summary"] or "") or (r["raw_text"] or "")[:400]
+        context_lines.append(f"[{i}] {r['title'] or 'Bez názvu'}: {body}")
+    context = "\n".join(context_lines)
+
+    # ── Synthesize (Claude, off the event loop) ───────────────────────────────
+    try:
+        answer = await loop.run_in_executor(None, _ask_claude, q, context)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Claude API error: {exc}") from exc
+
+    # Show only the sources the answer actually cites (none → no source list,
+    # e.g. when the brain had nothing relevant and Claude said so).
+    cited = {int(n) for n in _re.findall(r"\[(\d+)\]", answer)}
+    sources = [s for s in all_sources if s.n in cited]
+    return AskResponse(question=q, answer=answer, sources=sources)
+
+
 # ── Re-extract topics from stored text (for captures with empty topics) ──────
 
 @app.post("/reanalyze-topics/{capture_id}", summary="Re-extract topics using Claude (text-only)")
-async def reanalyze_topics(capture_id: str):
+async def reanalyze_topics(capture_id: str, user_id: str = Depends(get_current_user)):
     """
     Re-extracts topics, people, and places for a capture that has empty topics.
     Uses Claude text API on the stored summary + raw_text — no image needed.
@@ -675,7 +1064,7 @@ async def reanalyze_topics(capture_id: str):
     """
     # Fetch existing capture
     async with get_session() as session:
-        result = await session.run(Q.GET_CAPTURE_BY_ID, id=capture_id)
+        result = await session.run(Q.GET_CAPTURE_BY_ID, id=capture_id, uid=user_id)
         record = await result.single()
         if record is None:
             raise HTTPException(status_code=404, detail=f"Capture '{capture_id}' not found")
@@ -794,7 +1183,10 @@ Rules for topics:
 # ── Re-embed all captures (fixes zero embeddings from before Voyage AI key) ──
 
 @app.post("/reembed", summary="Recompute embeddings for all captures")
-async def reembed_all(force: bool = Query(default=False, description="Re-embed ALL, not just zero vectors")):
+async def reembed_all(
+    force: bool = Query(default=False, description="Re-embed ALL, not just zero vectors"),
+    user_id: str = Depends(get_current_user),
+):
     """
     Recomputes Voyage AI embeddings for captures with zero/missing embeddings.
 
@@ -804,7 +1196,7 @@ async def reembed_all(force: bool = Query(default=False, description="Re-embed A
     Pass ?force=true to re-embed every capture (e.g. after changing embed text).
     """
     async with get_session() as session:
-        result = await session.run(Q.GET_ALL_CAPTURES_FOR_REEMBED)
+        result = await session.run(Q.GET_ALL_CAPTURES_FOR_REEMBED, uid=user_id)
         records = [r async for r in result]
 
     # Collect captures that need (re)embedding
@@ -892,7 +1284,10 @@ async def _merge_capture_nodes(session, keep_id: str, drop_id: str) -> None:
 
 
 @app.post("/merge-duplicates", summary="Merge near-duplicate captures into one node")
-async def merge_duplicates(threshold: float = Query(default=0.88, ge=0.80, le=1.0)):
+async def merge_duplicates(
+    threshold: float = Query(default=0.88, ge=0.80, le=1.0),
+    user_id: str = Depends(get_current_user),
+):
     """
     Finds captures that are the SAME real-world entity (e.g. two screenshots of
     the same product page) and merges each duplicate into the oldest canonical
@@ -905,7 +1300,7 @@ async def merge_duplicates(threshold: float = Query(default=0.88, ge=0.80, le=1.
     both ~0.95) are never merged. Self-links from the merge are cleaned up after.
     """
     async with get_session() as session:
-        result = await session.run(Q.GET_ALL_CAPTURES_FULL)
+        result = await session.run(Q.GET_ALL_CAPTURES_FULL, uid=user_id)
         records = [r async for r in result]
 
     # Build lookup; iterate oldest-first so the canonical is the earliest capture
@@ -926,7 +1321,7 @@ async def merge_duplicates(threshold: float = Query(default=0.88, ge=0.80, le=1.
             # Find vector neighbours of this capture
             try:
                 rec = await session.run(
-                    Q.SEMANTIC_SEARCH, embedding=emb, k=10, limit=10
+                    Q.SEMANTIC_SEARCH, embedding=emb, k=10, limit=10, uid=user_id
                 )
                 neighbours = [r async for r in rec]
             except Exception as exc:
@@ -1018,7 +1413,10 @@ def _clean_subject_title(title: str) -> str:
 
 
 @app.post("/group-subjects", summary="Group captures of the same thing into Subject branches")
-async def group_subjects(threshold: float = Query(default=0.85, ge=0.70, le=1.0)):
+async def group_subjects(
+    threshold: float = Query(default=0.85, ge=0.70, le=1.0),
+    user_id: str = Depends(get_current_user),
+):
     """
     Builds :Subject branches. Captures depicting the same real-world thing — the
     same product seen on Alza / another e-shop / a personal photo — are grouped
@@ -1030,7 +1428,7 @@ async def group_subjects(threshold: float = Query(default=0.85, ge=0.70, le=1.0)
     import uuid
 
     async with get_session() as session:
-        result = await session.run(Q.GET_ALL_CAPTURES_FULL)
+        result = await session.run(Q.GET_ALL_CAPTURES_FULL, uid=user_id)
         records = [r async for r in result]
 
     caps = {
@@ -1068,7 +1466,7 @@ async def group_subjects(threshold: float = Query(default=0.85, ge=0.70, le=1.0)
             if not emb or not any(v != 0.0 for v in emb[:10]):
                 continue
             try:
-                rec = await session.run(Q.SEMANTIC_SEARCH, embedding=emb, k=10, limit=10)
+                rec = await session.run(Q.SEMANTIC_SEARCH, embedding=emb, k=10, limit=10, uid=user_id)
                 neighbours = [r async for r in rec]
             except Exception as exc:
                 logger.warning("Subject scan failed for %s: %s", cid[:8], exc)
@@ -1089,7 +1487,7 @@ async def group_subjects(threshold: float = Query(default=0.85, ge=0.70, le=1.0)
             clusters.setdefault(find(cid), []).append(cid)
 
         # Rebuild Subjects from scratch
-        await session.run(Q.CLEAR_SUBJECTS)
+        await session.run(Q.CLEAR_SUBJECTS, uid=user_id)
         subjects = []
         for members in clusters.values():
             if len(members) < 2:
@@ -1122,7 +1520,8 @@ async def group_subjects(threshold: float = Query(default=0.85, ge=0.70, le=1.0)
 
 
 async def _auto_group_on_upload(
-    capture_id: str, title: str, summary: str, raw_text: str, embedding: list[float]
+    capture_id: str, title: str, summary: str, raw_text: str,
+    embedding: list[float], user_id: str, source_hint: str | None = None,
 ) -> str | None:
     """
     Maintenance run automatically after each upload:
@@ -1134,13 +1533,13 @@ async def _auto_group_on_upload(
     import uuid
 
     async with get_session() as session:
-        source = _extract_source(title, summary, raw_text)
+        source = source_hint or _extract_source(title, summary, raw_text)
         await session.run(Q.SET_CAPTURE_SOURCE, id=capture_id, source=source)
 
         if not embedding or not any(v != 0.0 for v in embedding[:10]):
             return None
         try:
-            rec = await session.run(Q.SEMANTIC_SEARCH, embedding=embedding, k=10, limit=10)
+            rec = await session.run(Q.SEMANTIC_SEARCH, embedding=embedding, k=10, limit=10, uid=user_id)
             neighbours = [r async for r in rec]
         except Exception as exc:
             logger.warning("Auto-group scan failed: %s", exc)
@@ -1181,7 +1580,7 @@ async def _auto_group_on_upload(
 # ── Relink all captures (recompute LINKED_TO with current engine settings) ───
 
 @app.post("/relink", summary="Delete all links and recompute them from scratch")
-async def relink_all():
+async def relink_all(user_id: str = Depends(get_current_user)):
     """
     Deletes every LINKED_TO relationship and recomputes links
     using the current engine settings (thresholds, priority rules, etc.).
@@ -1193,12 +1592,12 @@ async def relink_all():
     """
     # Step 1: Delete all existing links
     async with get_session() as session:
-        await session.run(Q.DELETE_ALL_LINKS)
+        await session.run(Q.DELETE_ALL_LINKS, uid=user_id)
     logger.info("Deleted all existing LINKED_TO relationships")
 
     # Step 2: Load all captures with their embeddings
     async with get_session() as session:
-        result = await session.run(Q.GET_ALL_CAPTURES_FOR_RELINK)
+        result = await session.run(Q.GET_ALL_CAPTURES_FOR_RELINK, uid=user_id)
         records = [r async for r in result]
 
     total_captures = len(records)
@@ -1245,7 +1644,7 @@ async def relink_all():
 # ── Graph data (for web UI visualization) ────────────────────────────────────
 
 @app.get("/graph-data", summary="All nodes + edges for graph visualization")
-async def get_graph_data():
+async def get_graph_data(user_id: str = Depends(get_current_user)):
     """Returns all Capture nodes and LINKED_TO edges in vis-network format."""
     nodes = []
     edges = []
@@ -1253,9 +1652,11 @@ async def get_graph_data():
     async with get_session() as session:
         # All captures
         result = await session.run(
-            "MATCH (c:Capture) "
+            "MATCH (c:Capture) WHERE c.user_id = $uid "
             "RETURN c.id AS id, c.title AS title, c.summary AS summary, "
-            "       c.created_at AS created_at, coalesce(c.merged_count, 1) AS merged_count"
+            "       c.created_at AS created_at, coalesce(c.merged_count, 1) AS merged_count, "
+            "       c.place AS place, c.captured_at AS captured_at",
+            uid=user_id,
         )
         async for rec in result:
             nodes.append({
@@ -1263,15 +1664,18 @@ async def get_graph_data():
                 "label": (rec["title"] or "")[:35],
                 "title": (rec["summary"] or "")[:120],
                 "created_at": str(rec["created_at"]),
+                "captured_at": rec["captured_at"],   # real capture time (photos)
+                "place": rec["place"],               # venue → timeline Y lane
                 "merged_count": rec["merged_count"],
                 "type": "capture",
             })
 
         # All links
         result = await session.run(
-            "MATCH (a:Capture)-[r:LINKED_TO]->(b:Capture) "
+            "MATCH (a:Capture)-[r:LINKED_TO]->(b:Capture) WHERE a.user_id = $uid "
             "RETURN a.id AS from_id, b.id AS to_id, "
-            "       r.strength AS strength, r.type AS link_type"
+            "       r.strength AS strength, r.type AS link_type",
+            uid=user_id,
         )
         async for rec in result:
             edges.append({
@@ -1283,7 +1687,7 @@ async def get_graph_data():
             })
 
         # Subject branches: a hub node per Subject + a DEPICTS branch per capture
-        result = await session.run(Q.GET_SUBJECTS_GRAPH)
+        result = await session.run(Q.GET_SUBJECTS_GRAPH, uid=user_id)
         async for rec in result:
             sid = rec["subject_id"]
             nodes.append({

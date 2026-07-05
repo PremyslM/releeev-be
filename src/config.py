@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     app_port: int = 8000
     app_log_level: str = "info"
 
+    # Auth — set a strong JWT_SECRET in .env for production.
+    jwt_secret: str = "dev-secret-change-me"
+    jwt_ttl_days: int = 30
+
     # Linking thresholds
     # Calibrated for Voyage AI voyage-3 document-to-document cosine similarity.
     # voyage-3 doc↔doc scores range ~0.08–0.55; 0.38 keeps only genuinely related captures.

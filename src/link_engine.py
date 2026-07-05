@@ -312,11 +312,24 @@ async def findSimilarCaptures(
         except Exception as exc:
             logger.warning("Entity match query failed: %s", exc)
 
-        # ── Signals D/E/F: place / session / source (future iOS data) ───────────
-        # When the iOS app starts capturing geo, timestamps and shared-URL
-        # metadata, populate e.same_place / e.same_session / e.same_source here
-        # (e.g. via CO_LOCATED / SAME_SESSION / SAME_SOURCE Cypher queries).
-        # The scoring function already accounts for them.
+        # ── Signal D: same venue (co-located memories) ──────────────────────────
+        # Captures made at the same place — "that afternoon at café 14g". Feeds
+        # the same_place term in the scoring function.
+        try:
+            rec = await session.run(
+                Q.LOCATION_MATCH,
+                capture_id=capture_id,
+                limit=limit * 2,
+            )
+            async for row in rec:
+                e = _ev(row["capture_id"], row)
+                e.same_place = True
+        except Exception as exc:
+            logger.warning("Location match query failed: %s", exc)
+
+        # ── Signals E/F: session / source (future) ──────────────────────────────
+        # When timestamps (bursts) and shared-URL metadata are captured, populate
+        # e.same_session / e.same_source here; the scoring already accounts for them.
 
     # Combine evidence → confidence score per candidate
     min_strength = settings.link_strength_min
