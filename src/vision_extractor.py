@@ -48,6 +48,7 @@ following fields (all required):
   "raw_text":     "<all readable text extracted verbatim, or empty string>",
   "capture_type": "<one of: screenshot|photo|document|unknown>",
   "topics":       ["<keyword1>", ...],
+  "category":     "<exactly ONE broad domain category from the allowed list>",
   "people":       ["<full name if visible>", ...],
   "places":       ["<city / building / URL if visible>", ...],
   "language":     "<ISO-639-1 code, e.g. en>",
@@ -69,8 +70,11 @@ def extractAttributes(
     Send an image to Claude claude-opus-4-8 via the Vision API and parse the
     structured JSON response into an ExtractedAttributes object.
     """
+    from src.link_engine import DOMAIN_TOPICS  # local import: avoids any cycle
+
     t0 = time.perf_counter()
     client = _claude()
+    allowed = ", ".join(sorted(DOMAIN_TOPICS))
 
     response = client.messages.create(
         model="claude-opus-4-8",
@@ -90,7 +94,12 @@ def extractAttributes(
                     },
                     {
                         "type": "text",
-                        "text": "Analyse this image and return the JSON object.",
+                        "text": (
+                            "Analyse this image and return the JSON object. "
+                            f'The "category" must be exactly ONE of: {allowed}. '
+                            "Pick the closest one even for photos (e.g. a car photo → "
+                            "automotive). Do NOT put the category word itself into topics."
+                        ),
                     },
                 ],
             }
@@ -119,12 +128,20 @@ def extractAttributes(
     except ValueError:
         ct = CaptureType.unknown
 
+    # Ensure the broad domain category is one of the topics, so photos link to
+    # documents of the same domain (e.g. a car photo ↔ a car listing via
+    # "automotive"). Mirrors the URL/text extraction path.
+    topics = [t for t in data.get("topics", []) if isinstance(t, str)][:15]
+    category = (data.get("category") or "").strip().lower()
+    if category in DOMAIN_TOPICS and category not in [t.lower() for t in topics]:
+        topics.append(category)
+
     return ExtractedAttributes(
         title=data.get("title", ""),
         summary=data.get("summary", ""),
         raw_text=data.get("raw_text", ""),
         capture_type=ct,
-        topics=data.get("topics", []),
+        topics=topics,
         people=data.get("people", []),
         places=data.get("places", []),
         language=data.get("language", "en"),

@@ -53,6 +53,8 @@ from src.models import (
     SearchResult,
     SubjectInfo,
     SubjectSibling,
+    Theme,
+    ThemeListResponse,
 )
 from src.neo4j_driver import close_driver, get_session
 from src.schema_setup import run_schema_setup
@@ -663,6 +665,101 @@ async def list_entities(
     return EntityListResponse(topics=topics, people=people, places=places, subjects=subjects)
 
 
+# ── Themes: a few high-level labels that capture the whole brain ──────────────
+
+_THEMES_CACHE: dict[str, tuple[int, list[Theme]]] = {}   # user_id → (capture_count, themes)
+
+
+def _distill_themes_blocking(topics: list[tuple[str, int]]) -> list[dict]:
+    """Group fine-grained topics into 5-7 overarching themes via Claude.
+    Returns [{"name": str, "topics": [str, ...]}, …]. Blocking; run in executor."""
+    import json as _json
+    listing = "\n".join(f"- {name} ({cnt})" for name, cnt in topics)
+    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    resp = client.messages.create(
+        model="claude-opus-4-8",
+        max_tokens=700,
+        system=(
+            "You organise a personal knowledge base. Given its topics with "
+            "frequencies, produce 5-7 high-level themes that together capture the "
+            "WHOLE collection — broad, human, non-overlapping. Return ONLY JSON: "
+            '[{"name": "<short theme>", "topics": ["<member topic>", ...]}]. '
+            "Every input topic belongs to exactly one theme; names are 1-3 words, "
+            "in the language most topics use."
+        ),
+        messages=[{"role": "user", "content": f"Topics:\n{listing}"}],
+    )
+    raw = next((b.text for b in resp.content if b.type == "text"), "[]").strip()
+    if raw.startswith("```"):
+        raw = raw.split("```", 2)[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    try:
+        data = _json.loads(raw)
+        return [t for t in data if isinstance(t, dict) and t.get("name")]
+    except Exception:
+        return []
+
+
+@app.get("/themes", response_model=ThemeListResponse,
+         summary="A few high-level themes that capture the whole brain")
+async def list_themes(user_id: str = Depends(get_current_user)) -> ThemeListResponse:
+    async with get_session() as s:
+        cnt_rec = await (await s.run(
+            "MATCH (c:Capture) WHERE c.user_id = $uid RETURN count(c) AS n", uid=user_id
+        )).single()
+        total = cnt_rec["n"] if cnt_rec else 0
+        rec = await s.run(Q.LIST_TOPICS, limit=60, uid=user_id)
+        topic_counts = [(r["name"], r["cnt"]) async for r in rec]
+
+    # Cache: recompute only when the capture count changes (cheap invalidation).
+    cached = _THEMES_CACHE.get(user_id)
+    if cached and cached[0] == total:
+        return ThemeListResponse(themes=cached[1])
+
+    if not topic_counts:
+        return ThemeListResponse(themes=[])
+
+    # Few topics → no distillation needed; they're already a short list.
+    if len(topic_counts) <= 8:
+        themes = [Theme(name=n.capitalize(), count=c, topics=[n]) for n, c in topic_counts]
+        _THEMES_CACHE[user_id] = (total, themes)
+        return ThemeListResponse(themes=themes)
+
+    loop = asyncio.get_running_loop()
+    try:
+        grouped = await loop.run_in_executor(None, _distill_themes_blocking, topic_counts)
+    except Exception as exc:
+        logger.warning("Theme distillation failed: %s", exc)
+        grouped = []
+
+    if not grouped:  # fallback: top topics as-is
+        themes = [Theme(name=n.capitalize(), count=c, topics=[n]) for n, c in topic_counts[:8]]
+        _THEMES_CACHE[user_id] = (total, themes)
+        return ThemeListResponse(themes=themes)
+
+    # Accurate per-theme size: distinct captures across the theme's member topics.
+    async with get_session() as s:
+        rec = await s.run(
+            "UNWIND $themes AS th "
+            "OPTIONAL MATCH (c:Capture)-[:HAS_TOPIC]->(t:Topic) "
+            "WHERE c.user_id = $uid AND toLower(t.name) IN [x IN th.topics | toLower(x)] "
+            "RETURN th.name AS name, count(DISTINCT c) AS cnt",
+            themes=[{"name": g["name"], "topics": g.get("topics", [])} for g in grouped],
+            uid=user_id,
+        )
+        counts = {r["name"]: r["cnt"] async for r in rec}
+
+    themes = [
+        Theme(name=g["name"], count=counts.get(g["name"], 0), topics=g.get("topics", []))
+        for g in grouped
+    ]
+    themes = [t for t in themes if t.count > 0] or themes
+    themes.sort(key=lambda t: t.count, reverse=True)
+    _THEMES_CACHE[user_id] = (total, themes)
+    return ThemeListResponse(themes=themes)
+
+
 @app.get("/locations", response_model=LocationListResponse,
          summary="Places where captures were made — memory hubs (with coordinates)")
 async def list_locations(
@@ -769,6 +866,18 @@ def _embed_query_cached(q: str) -> tuple[float, ...]:
 
 def _to_native(dt):
     return dt.to_native() if hasattr(dt, "to_native") else dt
+
+
+def _rerank_blocking(query: str, documents: list[str]) -> list[tuple[int, float]]:
+    """
+    Reorder `documents` against `query` with Voyage's cross-encoder reranker.
+    Returns [(original_index, relevance_score), …] in descending relevance.
+    Blocking network call — run it in an executor. Caller handles failures.
+    """
+    from src.vision_extractor import _voyage
+    vc = _voyage()
+    res = vc.rerank(query, documents, model=settings.rerank_model)
+    return [(r.index, float(r.relevance_score)) for r in res.results]
 
 
 # Reciprocal Rank Fusion — combines several ranked lists into one robust ranking
@@ -907,6 +1016,22 @@ async def search_captures(
     # junk). Keep only items within 40% of the top — that's the "relevant set".
     top_all = ordered_all[0][1] if ordered_all else 1.0
     relevant = [(cid, sc) for cid, sc in ordered_all if (sc / top_all) >= _MIN_RESULT_SCORE]
+
+    # ── Rerank: a Voyage cross-encoder reorders the top candidates by true
+    # query↔document relevance (sharper than rank fusion). Non-fatal: any error
+    # keeps the RRF order. Only the top window is reranked; the tail is appended.
+    if settings.rerank_enabled and len(relevant) > 1:
+        window = relevant[: settings.rerank_candidates]
+        docs = [
+            f"{meta[cid]['title']} — {meta[cid]['summary']}".strip(" —")[:1600]
+            for cid, _ in window
+        ]
+        try:
+            order = await loop.run_in_executor(None, _rerank_blocking, q, docs)
+            reranked = [(window[i][0], score) for i, score in order]
+            relevant = reranked + relevant[settings.rerank_candidates:]
+        except Exception as exc:
+            logger.warning("Rerank failed (using RRF order): %s", exc)
 
     # ── Fetch structured fields for the relevant matches (one batched lookup) ──
     facet_map: dict[str, dict] = {}

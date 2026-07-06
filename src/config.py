@@ -40,6 +40,12 @@ class Settings(BaseSettings):
     # once, so cold starts don't re-run it.
     run_schema_setup: bool = True
 
+    # Search reranking — a Voyage cross-encoder reorders the fused candidate set
+    # for sharper top results. Falls back to the RRF order on any error.
+    rerank_enabled: bool = True
+    rerank_model: str = "rerank-2-lite"   # fast + cheap; "rerank-2" is stronger
+    rerank_candidates: int = 30           # how many top RRF hits to rerank
+
     # Linking thresholds
     # Calibrated for Voyage AI voyage-3 document-to-document cosine similarity.
     # voyage-3 doc↔doc scores range ~0.08–0.55; 0.38 keeps only genuinely related captures.
