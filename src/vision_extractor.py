@@ -31,7 +31,9 @@ def _claude() -> anthropic.Anthropic:
 def _voyage() -> voyageai.Client:
     # Use VOYAGE_API_KEY if set, otherwise try ANTHROPIC_API_KEY
     key = settings.voyage_api_key or settings.anthropic_api_key
-    return voyageai.Client(api_key=key)
+    # max_retries=0: on the free tier's 3 RPM limit, fail fast (~100ms) instead
+    # of letting tenacity back-off for ~1.7s and blocking the search request.
+    return voyageai.Client(api_key=key, max_retries=0)
 
 
 # ── Extraction prompt ─────────────────────────────────────────────────────────
@@ -131,6 +133,80 @@ def extractAttributes(
     )
 
 
+def extractAttributesFromText(
+    text: str, url: str = "", signals: dict | None = None
+) -> ExtractedAttributes:
+    """
+    Build structured attributes from a web page's text (instead of an image).
+
+    Used by POST /analyze-url. Mirrors extractAttributes() but the input is the
+    page's text + HTML signals (title, OG tags) rather than pixels.
+    """
+    from src.link_engine import DOMAIN_TOPICS  # local import: avoids any cycle
+
+    client = _claude()
+    signals = signals or {}
+    sig_lines = "\n".join(f"{k}: {v}" for k, v in signals.items() if v)
+    allowed = ", ".join(sorted(DOMAIN_TOPICS))
+
+    prompt = f"""Analyse this web page and return ONLY valid JSON, no prose.
+
+URL: {url}
+{sig_lines}
+
+Page text (truncated):
+{text[:3500]}
+
+Return JSON:
+{{
+  "title":    "<concise descriptive title>",
+  "summary":  "<2-3 sentence summary of the page>",
+  "topics":   ["<6-10 specific English topic keywords>"],
+  "category": "<exactly ONE of: {allowed}>",
+  "people":   ["<real person names, or []>"],
+  "places":   ["<real place names / brands, or []>"],
+  "language": "<ISO-639-1 code>",
+  "sentiment":"<positive|negative|neutral>"
+}}
+
+Rules: canonical/standardized topics; specific over generic; do NOT put the
+category word itself into topics."""
+
+    resp = client.messages.create(
+        model="claude-opus-4-8",
+        max_tokens=800,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = next((b.text for b in resp.content if b.type == "text"), "{}").strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.error("URL attribute JSON parse failed: %s\nRaw: %s", exc, raw[:300])
+        data = {}
+
+    topics = [t for t in data.get("topics", []) if isinstance(t, str)][:15]
+    category = (data.get("category") or "").strip().lower()
+    if category in DOMAIN_TOPICS and category not in [t.lower() for t in topics]:
+        topics.append(category)
+
+    return ExtractedAttributes(
+        title=data.get("title", "") or (signals.get("og:title") or signals.get("page title") or url),
+        summary=data.get("summary", ""),
+        raw_text=text[:2000],
+        capture_type=CaptureType.document,
+        topics=topics,
+        people=[p for p in data.get("people", []) if isinstance(p, str)][:10],
+        places=[pl for pl in data.get("places", []) if isinstance(pl, str)][:10],
+        language=data.get("language", "en"),
+        sentiment=data.get("sentiment", "neutral"),
+        confidence=0.85,
+    )
+
+
 def getEmbedding(text: str) -> list[float]:
     """
     Generate a 1024-dimensional embedding vector using Voyage AI
@@ -152,3 +228,36 @@ def getEmbedding(text: str) -> list[float]:
     except Exception as exc:  # noqa: BLE001
         logger.error("getEmbedding failed: %s", exc)
         return [0.0] * 1024
+
+
+def getEmbeddingsBatch(texts: list[str]) -> list[list[float]]:
+    """
+    Embed many texts in a SINGLE Voyage API request.
+
+    The Voyage free tier is limited to 3 requests/minute, so embedding captures
+    one-by-one quickly hits the rate limit. Batching all texts into one call
+    avoids that entirely (one request, regardless of how many texts).
+
+    Returns a list of 1024-dim vectors aligned with the input order.
+    Empty/blank inputs get a zero-vector; on total failure all are zero-vectors.
+    """
+    if not texts:
+        return []
+
+    # Replace blank texts with a single space (Voyage rejects empty strings)
+    safe = [t if t.strip() else " " for t in texts]
+
+    try:
+        vc = _voyage()
+        result = vc.embed(
+            texts=safe,
+            model="voyage-3",
+            input_type="document",
+        )
+        out: list[list[float]] = []
+        for i, emb in enumerate(result.embeddings):
+            out.append([0.0] * 1024 if not texts[i].strip() else emb)
+        return out
+    except Exception as exc:  # noqa: BLE001
+        logger.error("getEmbeddingsBatch failed (%d texts): %s", len(texts), exc)
+        return [[0.0] * 1024 for _ in texts]

@@ -31,10 +31,21 @@ class Settings(BaseSettings):
     app_port: int = 8000
     app_log_level: str = "info"
 
+    # Auth — set a strong JWT_SECRET in .env for production.
+    jwt_secret: str = "dev-secret-change-me"
+    jwt_ttl_days: int = 30
+
+    # Run the idempotent schema bootstrap on startup. Safe to leave on locally;
+    # on serverless (Vercel) set RUN_SCHEMA_SETUP=false after creating the schema
+    # once, so cold starts don't re-run it.
+    run_schema_setup: bool = True
+
     # Linking thresholds
-    cosine_similarity_threshold: float = 0.75
+    # Calibrated for Voyage AI voyage-3 document-to-document cosine similarity.
+    # voyage-3 doc↔doc scores range ~0.08–0.55; 0.38 keeps only genuinely related captures.
+    cosine_similarity_threshold: float = 0.65
     temporal_proximity_days: int = 90
-    link_strength_min: float = 0.3
+    link_strength_min: float = 0.25
 
 
 settings = Settings()

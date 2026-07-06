@@ -78,6 +78,11 @@ class CaptureLink(BaseModel):
     link_type: LinkType
     strength: float = Field(ge=0.0, le=1.0)
     meta: dict[str, Any] = Field(default_factory=dict)
+    # Denormalized for display — filled by GET /captures/{id}
+    other_title: str = ""
+    other_summary: str = ""
+    shared_topics: list[str] = Field(default_factory=list)
+    reasons: list[str] = Field(default_factory=list)  # why these are linked
 
 
 # ── API request / response models ─────────────────────────────────────────────
@@ -91,6 +96,17 @@ class AnalyzeCaptureRequest(BaseModel):
         default="image/jpeg",
         pattern=r"^image/(jpeg|png|webp|gif)$",
     )
+    # Optional capture location (from photo EXIF / device GPS, reverse-geocoded
+    # on the client). Turns a photo into a place-anchored memory.
+    lat: float | None = None
+    lon: float | None = None
+    place: str | None = None        # e.g. "Kavárna 14g"
+    locality: str | None = None     # e.g. "Mariánské Lázně"
+    captured_at: str | None = None  # real capture time (ISO), distinct from upload
+
+
+class AnalyzeUrlRequest(BaseModel):
+    url: str = Field(..., description="Webová adresa ke zpracování")
 
 
 class LinkedCapture(BaseModel):
@@ -99,6 +115,7 @@ class LinkedCapture(BaseModel):
     strength: float
     title: str = ""
     summary: str = ""
+    reasons: list[str] = Field(default_factory=list)  # why these are linked
 
 
 class AnalyzeCaptureResponse(BaseModel):
@@ -107,11 +124,37 @@ class AnalyzeCaptureResponse(BaseModel):
     embedding_dim: int
     linked_to: list[LinkedCapture] = Field(default_factory=list)
     processing_ms: int = 0
+    subject_name: str | None = None  # set if auto-grouped into a Subject branch
+
+
+class SubjectSibling(BaseModel):
+    id: str
+    title: str = ""
+    source: str = ""
+
+
+class SubjectInfo(BaseModel):
+    """The real-world thing this capture depicts, seen across several sources."""
+    subject_id: str
+    name: str = ""
+    kind: str = ""
+    siblings: list[SubjectSibling] = Field(default_factory=list)
+
+
+class LocationInfo(BaseModel):
+    """Where a capture was made — the anchor for a place-based memory."""
+    lat: float
+    lon: float
+    place: str = ""
+    locality: str = ""
+    captured_at: str | None = None
 
 
 class CaptureDetailResponse(BaseModel):
     capture: CaptureNode
     connections: list[CaptureLink] = Field(default_factory=list)
+    subject: SubjectInfo | None = None
+    location: LocationInfo | None = None
 
 
 class SearchResult(BaseModel):
@@ -120,12 +163,95 @@ class SearchResult(BaseModel):
     summary: str
     score: float
     created_at: datetime
+    category: str = ""        # domain (for the coloured dot / label)
+    capture_type: str = ""    # photo | document | note … (for the row icon)
+
+
+class AskSource(BaseModel):
+    """A capture cited in a RAG answer."""
+    n: int
+    capture_id: str
+    title: str = ""
+    category: str = ""
+    capture_type: str = ""
+    created_at: datetime | None = None
+
+
+class AskResponse(BaseModel):
+    """Answer synthesized strictly from the user's own captures, with citations."""
+    question: str
+    answer: str
+    sources: list[AskSource] = Field(default_factory=list)
 
 
 class SearchResponse(BaseModel):
     query: str
     results: list[SearchResult]
     total: int
+    # Auto-derived refinement chips: {facet_type: {value: count}} over the
+    # relevant matches. The UI renders these as one-click filters — the user
+    # never configures anything.
+    facets: dict[str, dict[str, int]] = Field(default_factory=dict)
+
+
+# ── Entity navigation (browsable hubs) ──────────────────────────────────────────
+
+class EntityRef(BaseModel):
+    name: str
+    kind: str          # topic | person | place | subject
+    count: int = 0     # how many captures reference it
+
+
+class EntityListResponse(BaseModel):
+    """Landmarks for browsing — the most-referenced entities of each type."""
+    topics: list[EntityRef] = Field(default_factory=list)
+    people: list[EntityRef] = Field(default_factory=list)
+    places: list[EntityRef] = Field(default_factory=list)
+    subjects: list[EntityRef] = Field(default_factory=list)
+
+
+class EntityCapture(BaseModel):
+    capture_id: str
+    title: str = ""
+    summary: str = ""
+
+
+class EntityDetailResponse(BaseModel):
+    """A single entity's page: its captures + co-occurring entities to hop to."""
+    entity: EntityRef
+    captures: list[EntityCapture] = Field(default_factory=list)
+    related: list[EntityRef] = Field(default_factory=list)
+
+
+class LocationSummary(BaseModel):
+    """A place where captures were made — a memory hub."""
+    name: str
+    locality: str = ""
+    lat: float | None = None
+    lon: float | None = None
+    count: int = 0
+
+
+class LocationListResponse(BaseModel):
+    locations: list[LocationSummary] = Field(default_factory=list)
+
+
+# ── Auth ────────────────────────────────────────────────────────────────────────
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str = Field(min_length=6)
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class AuthResponse(BaseModel):
+    token: str
+    user_id: str
+    email: str
 
 
 # ── Error model ────────────────────────────────────────────────────────────────
