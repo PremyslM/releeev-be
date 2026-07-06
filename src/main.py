@@ -771,6 +771,18 @@ def _to_native(dt):
     return dt.to_native() if hasattr(dt, "to_native") else dt
 
 
+def _rerank_blocking(query: str, documents: list[str]) -> list[tuple[int, float]]:
+    """
+    Reorder `documents` against `query` with Voyage's cross-encoder reranker.
+    Returns [(original_index, relevance_score), …] in descending relevance.
+    Blocking network call — run it in an executor. Caller handles failures.
+    """
+    from src.vision_extractor import _voyage
+    vc = _voyage()
+    res = vc.rerank(query, documents, model=settings.rerank_model)
+    return [(r.index, float(r.relevance_score)) for r in res.results]
+
+
 # Reciprocal Rank Fusion — combines several ranked lists into one robust ranking
 # without needing comparable score scales. score(d) = Σ w / (k + rank(d)).
 _RRF_K = 60
@@ -907,6 +919,22 @@ async def search_captures(
     # junk). Keep only items within 40% of the top — that's the "relevant set".
     top_all = ordered_all[0][1] if ordered_all else 1.0
     relevant = [(cid, sc) for cid, sc in ordered_all if (sc / top_all) >= _MIN_RESULT_SCORE]
+
+    # ── Rerank: a Voyage cross-encoder reorders the top candidates by true
+    # query↔document relevance (sharper than rank fusion). Non-fatal: any error
+    # keeps the RRF order. Only the top window is reranked; the tail is appended.
+    if settings.rerank_enabled and len(relevant) > 1:
+        window = relevant[: settings.rerank_candidates]
+        docs = [
+            f"{meta[cid]['title']} — {meta[cid]['summary']}".strip(" —")[:1600]
+            for cid, _ in window
+        ]
+        try:
+            order = await loop.run_in_executor(None, _rerank_blocking, q, docs)
+            reranked = [(window[i][0], score) for i, score in order]
+            relevant = reranked + relevant[settings.rerank_candidates:]
+        except Exception as exc:
+            logger.warning("Rerank failed (using RRF order): %s", exc)
 
     # ── Fetch structured fields for the relevant matches (one batched lookup) ──
     facet_map: dict[str, dict] = {}
