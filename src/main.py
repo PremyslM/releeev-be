@@ -34,6 +34,8 @@ from src.models import (
     AskResponse,
     AskSource,
     AuthResponse,
+    BugReportRequest,
+    BugReportResponse,
     LoginRequest,
     RegisterRequest,
     LocationInfo,
@@ -224,6 +226,69 @@ async def claim_orphans(user_id: str = Depends(get_current_user)):
         rec = await (await session.run(Q.CLAIM_ORPHAN_CAPTURES, user_id=user_id)).single()
     claimed = rec["n"] if rec else 0
     return {"claimed": claimed, "user_id": user_id}
+
+
+# ── Bug reporting → GitHub Issues ─────────────────────────────────────────────
+
+@app.post("/bug-report", response_model=BugReportResponse,
+          summary="File an in-app bug report as a GitHub issue")
+async def bug_report(
+    req: BugReportRequest,
+    user_id: str = Depends(get_current_user),
+) -> BugReportResponse:
+    """
+    Turn an in-app report (text + optional screenshot) into a GitHub issue. The
+    GitHub token lives only on the server, so it's never shipped in the app.
+    """
+    if not settings.github_token or not settings.github_repo:
+        raise HTTPException(status_code=503,
+                            detail="Hlášení chyb není nakonfigurováno (GITHUB_TOKEN/GITHUB_REPO).")
+
+    import httpx
+    api = f"https://api.github.com/repos/{settings.github_repo}"
+    headers = {
+        "Authorization": f"Bearer {settings.github_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    body = [req.description.strip() or "_(bez popisu)_"]
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        # Optional screenshot: commit it into the repo, then embed its raw URL.
+        if req.image_base64:
+            path = f"bug-reports/{uuid4().hex}.jpg"
+            try:
+                up = await client.put(
+                    f"{api}/contents/{path}", headers=headers,
+                    json={"message": f"chore: bug screenshot {path}", "content": req.image_base64},
+                )
+                if up.status_code in (200, 201):
+                    dl = (up.json().get("content") or {}).get("download_url")
+                    if dl:
+                        body.append(f"\n\n![screenshot]({dl})")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Bug screenshot upload failed (non-fatal): %s", exc)
+
+        meta = []
+        if req.app_version: meta.append(f"app: `{req.app_version}`")
+        if req.device: meta.append(f"device: `{req.device}`")
+        meta.append(f"user: `{user_id}`")
+        body.append("\n\n---\n" + " · ".join(meta) + "\n_Reported from the app._")
+
+        title = (req.title.strip() or (req.description.strip()[:60] or "Bug report")).splitlines()[0]
+        try:
+            issue = await client.post(
+                f"{api}/issues", headers=headers,
+                json={"title": f"[app] {title}", "body": "".join(body)},
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"GitHub nedostupný: {exc}") from exc
+
+    if issue.status_code not in (200, 201):
+        raise HTTPException(status_code=502,
+                            detail=f"GitHub API {issue.status_code}: {issue.text[:200]}")
+    data = issue.json()
+    return BugReportResponse(url=data["html_url"], number=data["number"])
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────

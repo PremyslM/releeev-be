@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     jwt_secret: str = "dev-secret-change-me"
     jwt_ttl_days: int = 30
 
+    # Bug reporting → GitHub Issues. Server-side token (never shipped in the app).
+    # GITHUB_TOKEN needs `repo` scope; GITHUB_REPO is "owner/name".
+    github_token: str = ""
+    github_repo: str = ""
+
     # Run the idempotent schema bootstrap on startup. Safe to leave on locally;
     # on serverless (Vercel) set RUN_SCHEMA_SETUP=false after creating the schema
     # once, so cold starts don't re-run it.
