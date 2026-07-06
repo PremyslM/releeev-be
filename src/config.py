@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     jwt_secret: str = "dev-secret-change-me"
     jwt_ttl_days: int = 30
 
+    # Bug reporting → GitHub Issues. Server-side token (never shipped in the app).
+    # GITHUB_TOKEN needs `repo` scope; GITHUB_REPO is "owner/name".
+    github_token: str = ""
+    github_repo: str = ""
+
     # Run the idempotent schema bootstrap on startup. Safe to leave on locally;
     # on serverless (Vercel) set RUN_SCHEMA_SETUP=false after creating the schema
     # once, so cold starts don't re-run it.
@@ -45,6 +50,9 @@ class Settings(BaseSettings):
     rerank_enabled: bool = True
     rerank_model: str = "rerank-2-lite"   # fast + cheap; "rerank-2" is stronger
     rerank_candidates: int = 30           # how many top RRF hits to rerank
+    # Drop results whose reranker relevance is below this — keeps search precise
+    # (only genuinely-related hits) instead of returning every fused match.
+    rerank_min_score: float = 0.35
 
     # Linking thresholds
     # Calibrated for Voyage AI voyage-3 document-to-document cosine similarity.

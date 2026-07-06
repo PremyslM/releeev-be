@@ -34,6 +34,8 @@ from src.models import (
     AskResponse,
     AskSource,
     AuthResponse,
+    BugReportRequest,
+    BugReportResponse,
     LoginRequest,
     RegisterRequest,
     LocationInfo,
@@ -224,6 +226,69 @@ async def claim_orphans(user_id: str = Depends(get_current_user)):
         rec = await (await session.run(Q.CLAIM_ORPHAN_CAPTURES, user_id=user_id)).single()
     claimed = rec["n"] if rec else 0
     return {"claimed": claimed, "user_id": user_id}
+
+
+# ── Bug reporting → GitHub Issues ─────────────────────────────────────────────
+
+@app.post("/bug-report", response_model=BugReportResponse,
+          summary="File an in-app bug report as a GitHub issue")
+async def bug_report(
+    req: BugReportRequest,
+    user_id: str = Depends(get_current_user),
+) -> BugReportResponse:
+    """
+    Turn an in-app report (text + optional screenshot) into a GitHub issue. The
+    GitHub token lives only on the server, so it's never shipped in the app.
+    """
+    if not settings.github_token or not settings.github_repo:
+        raise HTTPException(status_code=503,
+                            detail="Hlášení chyb není nakonfigurováno (GITHUB_TOKEN/GITHUB_REPO).")
+
+    import httpx
+    api = f"https://api.github.com/repos/{settings.github_repo}"
+    headers = {
+        "Authorization": f"Bearer {settings.github_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    body = [req.description.strip() or "_(bez popisu)_"]
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        # Optional screenshot: commit it into the repo, then embed its raw URL.
+        if req.image_base64:
+            path = f"bug-reports/{uuid4().hex}.jpg"
+            try:
+                up = await client.put(
+                    f"{api}/contents/{path}", headers=headers,
+                    json={"message": f"chore: bug screenshot {path}", "content": req.image_base64},
+                )
+                if up.status_code in (200, 201):
+                    dl = (up.json().get("content") or {}).get("download_url")
+                    if dl:
+                        body.append(f"\n\n![screenshot]({dl})")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Bug screenshot upload failed (non-fatal): %s", exc)
+
+        meta = []
+        if req.app_version: meta.append(f"app: `{req.app_version}`")
+        if req.device: meta.append(f"device: `{req.device}`")
+        meta.append(f"user: `{user_id}`")
+        body.append("\n\n---\n" + " · ".join(meta) + "\n_Reported from the app._")
+
+        title = (req.title.strip() or (req.description.strip()[:60] or "Bug report")).splitlines()[0]
+        try:
+            issue = await client.post(
+                f"{api}/issues", headers=headers,
+                json={"title": f"[app] {title}", "body": "".join(body)},
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"GitHub nedostupný: {exc}") from exc
+
+    if issue.status_code not in (200, 201):
+        raise HTTPException(status_code=502,
+                            detail=f"GitHub API {issue.status_code}: {issue.text[:200]}")
+    data = issue.json()
+    return BugReportResponse(url=data["html_url"], number=data["number"])
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -1017,9 +1082,12 @@ async def search_captures(
     top_all = ordered_all[0][1] if ordered_all else 1.0
     relevant = [(cid, sc) for cid, sc in ordered_all if (sc / top_all) >= _MIN_RESULT_SCORE]
 
-    # ── Rerank: a Voyage cross-encoder reorders the top candidates by true
-    # query↔document relevance (sharper than rank fusion). Non-fatal: any error
-    # keeps the RRF order. Only the top window is reranked; the tail is appended.
+    # ── Rerank + relevance cutoff: a Voyage cross-encoder scores each candidate
+    # for true query↔document relevance. We reorder by it AND drop anything below
+    # an absolute floor, so a search only returns what genuinely matches (instead
+    # of every loosely-fused hit). The top match is always kept. Non-fatal: any
+    # error keeps the RRF order. Only the top window is reranked; the tail (beyond
+    # the window) is dropped for precision.
     if settings.rerank_enabled and len(relevant) > 1:
         window = relevant[: settings.rerank_candidates]
         docs = [
@@ -1029,7 +1097,9 @@ async def search_captures(
         try:
             order = await loop.run_in_executor(None, _rerank_blocking, q, docs)
             reranked = [(window[i][0], score) for i, score in order]
-            relevant = reranked + relevant[settings.rerank_candidates:]
+            floor = settings.rerank_min_score
+            kept = [(cid, sc) for cid, sc in reranked if sc >= floor]
+            relevant = kept or reranked[:1]   # never return nothing when we had a match
         except Exception as exc:
             logger.warning("Rerank failed (using RRF order): %s", exc)
 
@@ -1792,12 +1862,14 @@ async def get_graph_data(user_id: str = Depends(get_current_user)):
     edges = []
 
     async with get_session() as session:
-        # All captures
+        # Most-recent captures (bounded so a large brain returns a light payload;
+        # the client renders a ~60-node overview from these anyway).
         result = await session.run(
             "MATCH (c:Capture) WHERE c.user_id = $uid "
             "RETURN c.id AS id, c.title AS title, c.summary AS summary, "
             "       c.created_at AS created_at, coalesce(c.merged_count, 1) AS merged_count, "
-            "       c.place AS place, c.captured_at AS captured_at",
+            "       c.place AS place, c.captured_at AS captured_at "
+            "ORDER BY c.created_at DESC LIMIT 500",
             uid=user_id,
         )
         async for rec in result:

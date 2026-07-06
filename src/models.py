@@ -210,6 +210,20 @@ class EntityListResponse(BaseModel):
     subjects: list[EntityRef] = Field(default_factory=list)
 
 
+class BugReportRequest(BaseModel):
+    """A user-submitted bug: free text + an optional screenshot (base64 JPEG)."""
+    title: str = ""
+    description: str = ""
+    image_base64: str | None = None
+    app_version: str = ""
+    device: str = ""
+
+
+class BugReportResponse(BaseModel):
+    url: str          # GitHub issue html_url
+    number: int
+
+
 class Theme(BaseModel):
     """A high-level theme distilled from many fine-grained topics — the handful
     of labels that capture what the whole brain is about."""
