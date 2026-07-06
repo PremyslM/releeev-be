@@ -1017,9 +1017,12 @@ async def search_captures(
     top_all = ordered_all[0][1] if ordered_all else 1.0
     relevant = [(cid, sc) for cid, sc in ordered_all if (sc / top_all) >= _MIN_RESULT_SCORE]
 
-    # ── Rerank: a Voyage cross-encoder reorders the top candidates by true
-    # query↔document relevance (sharper than rank fusion). Non-fatal: any error
-    # keeps the RRF order. Only the top window is reranked; the tail is appended.
+    # ── Rerank + relevance cutoff: a Voyage cross-encoder scores each candidate
+    # for true query↔document relevance. We reorder by it AND drop anything below
+    # an absolute floor, so a search only returns what genuinely matches (instead
+    # of every loosely-fused hit). The top match is always kept. Non-fatal: any
+    # error keeps the RRF order. Only the top window is reranked; the tail (beyond
+    # the window) is dropped for precision.
     if settings.rerank_enabled and len(relevant) > 1:
         window = relevant[: settings.rerank_candidates]
         docs = [
@@ -1029,7 +1032,9 @@ async def search_captures(
         try:
             order = await loop.run_in_executor(None, _rerank_blocking, q, docs)
             reranked = [(window[i][0], score) for i, score in order]
-            relevant = reranked + relevant[settings.rerank_candidates:]
+            floor = settings.rerank_min_score
+            kept = [(cid, sc) for cid, sc in reranked if sc >= floor]
+            relevant = kept or reranked[:1]   # never return nothing when we had a match
         except Exception as exc:
             logger.warning("Rerank failed (using RRF order): %s", exc)
 

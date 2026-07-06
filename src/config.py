@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     rerank_enabled: bool = True
     rerank_model: str = "rerank-2-lite"   # fast + cheap; "rerank-2" is stronger
     rerank_candidates: int = 30           # how many top RRF hits to rerank
+    # Drop results whose reranker relevance is below this — keeps search precise
+    # (only genuinely-related hits) instead of returning every fused match.
+    rerank_min_score: float = 0.35
 
     # Linking thresholds
     # Calibrated for Voyage AI voyage-3 document-to-document cosine similarity.
