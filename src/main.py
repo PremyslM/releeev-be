@@ -1797,12 +1797,14 @@ async def get_graph_data(user_id: str = Depends(get_current_user)):
     edges = []
 
     async with get_session() as session:
-        # All captures
+        # Most-recent captures (bounded so a large brain returns a light payload;
+        # the client renders a ~60-node overview from these anyway).
         result = await session.run(
             "MATCH (c:Capture) WHERE c.user_id = $uid "
             "RETURN c.id AS id, c.title AS title, c.summary AS summary, "
             "       c.created_at AS created_at, coalesce(c.merged_count, 1) AS merged_count, "
-            "       c.place AS place, c.captured_at AS captured_at",
+            "       c.place AS place, c.captured_at AS captured_at "
+            "ORDER BY c.created_at DESC LIMIT 500",
             uid=user_id,
         )
         async for rec in result:
