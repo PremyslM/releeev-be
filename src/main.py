@@ -245,9 +245,13 @@ async def bug_report(
                             detail="Hlášení chyb není nakonfigurováno (GITHUB_TOKEN/GITHUB_REPO).")
 
     import httpx
-    api = f"https://api.github.com/repos/{settings.github_repo}"
+    # Sanitize: take just "owner/repo" even if the env value picked up trailing
+    # spaces or an accidental comment, and drop any surrounding whitespace/token.
+    repo = settings.github_repo.strip().split()[0].strip("/")
+    token = settings.github_token.strip()
+    api = f"https://api.github.com/repos/{repo}"
     headers = {
-        "Authorization": f"Bearer {settings.github_token}",
+        "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
