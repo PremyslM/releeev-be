@@ -45,7 +45,7 @@ services:
       # Local dev talks to the bundled Community neo4j, whose only database is
       # `neo4j`. Override the Aura database name that .env carries for prod.
       NEO4J_DATABASE: ${NEO4J_LOCAL_DATABASE:-neo4j}
-      APP_ENV: production
+      APP_ENV: development       # local Docker = the development environment
       APP_HOST: "0.0.0.0"
       APP_PORT: "8000"
     ports:

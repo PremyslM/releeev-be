@@ -76,6 +76,15 @@ logger = logging.getLogger("brain_graph")
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     logger.info("Starting Brain Graph API (env=%s)", settings.app_env)
+    # Fail fast on an insecure/misconfigured production deploy — better to refuse
+    # to boot than to serve auth with the dev JWT secret. Non-prod stays lenient.
+    fatal, warnings = settings.safety_problems()
+    for w in warnings:
+        logger.warning("CONFIG: %s", w)
+    if fatal:
+        for f in fatal:
+            logger.error("CONFIG: %s", f)
+        raise RuntimeError("Insecure production configuration: " + " ".join(fatal))
     # Schema setup is idempotent and only needs to run once per database. On
     # serverless (Vercel) it runs on every cold start and MUST NOT crash the app
     # if the DB is briefly unreachable or misconfigured — otherwise the whole

@@ -47,5 +47,30 @@ class Settings(BaseSettings):
     temporal_proximity_days: int = 90
     link_strength_min: float = 0.25
 
+    # ── Environment helpers ──────────────────────────────────────────────────
+    @property
+    def is_production(self) -> bool:
+        return self.app_env.strip().lower() in ("production", "prod")
+
+    def safety_problems(self) -> tuple[list[str], list[str]]:
+        """
+        Validate the config for the current environment.
+
+        Returns (fatal, warnings). `fatal` items are misconfigurations that make
+        a *production* deploy insecure or non-functional — the app should refuse
+        to boot. `warnings` are logged but non-blocking. In non-production
+        environments nothing is fatal (local dev / tests stay frictionless).
+        """
+        fatal: list[str] = []
+        warnings: list[str] = []
+        if self.is_production:
+            if self.jwt_secret == "dev-secret-change-me" or len(self.jwt_secret) < 16:
+                fatal.append("JWT_SECRET must be a strong random value (≥16 chars) in production.")
+            if not self.anthropic_api_key:
+                warnings.append("ANTHROPIC_API_KEY is empty — capture analysis will fail.")
+            if self.neo4j_password in ("", "neo4j", "changeme", "12345678"):
+                warnings.append("NEO4J_PASSWORD looks like a placeholder/default.")
+        return fatal, warnings
+
 
 settings = Settings()
