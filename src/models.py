@@ -210,6 +210,18 @@ class EntityListResponse(BaseModel):
     subjects: list[EntityRef] = Field(default_factory=list)
 
 
+class Theme(BaseModel):
+    """A high-level theme distilled from many fine-grained topics — the handful
+    of labels that capture what the whole brain is about."""
+    name: str
+    count: int = 0                                   # captures this theme spans
+    topics: list[str] = Field(default_factory=list)  # fine-grained topics it groups
+
+
+class ThemeListResponse(BaseModel):
+    themes: list[Theme] = Field(default_factory=list)
+
+
 class EntityCapture(BaseModel):
     capture_id: str
     title: str = ""
