@@ -41,6 +41,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+      # @vercel/python's build step shells out to `uv`; it isn't preinstalled on
+      # the runner, so `vercel build` fails with "uv is required" without this.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
       - name: Install Vercel CLI
         run: npm install -g vercel@latest
       - name: Pick target environment
