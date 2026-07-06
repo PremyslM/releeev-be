@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     jwt_secret: str = "dev-secret-change-me"
     jwt_ttl_days: int = 30
 
+    # Run the idempotent schema bootstrap on startup. Safe to leave on locally;
+    # on serverless (Vercel) set RUN_SCHEMA_SETUP=false after creating the schema
+    # once, so cold starts don't re-run it.
+    run_schema_setup: bool = True
+
     # Linking thresholds
     # Calibrated for Voyage AI voyage-3 document-to-document cosine similarity.
     # voyage-3 doc↔doc scores range ~0.08–0.55; 0.38 keeps only genuinely related captures.
