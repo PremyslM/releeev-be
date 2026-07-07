@@ -30,6 +30,7 @@ from src.link_engine import DOMAIN_TOPICS, findSimilarCaptures, persistLinks
 from src.models import (
     AnalyzeCaptureRequest,
     AnalyzeCaptureResponse,
+    AnalyzeNoteRequest,
     AnalyzeUrlRequest,
     AskResponse,
     AskSource,
@@ -62,6 +63,7 @@ from src.neo4j_driver import close_driver, get_session
 from src.schema_setup import run_schema_setup
 from src.vision_extractor import (
     extractAttributes,
+    extractAttributesFromNote,
     extractAttributesFromText,
     getEmbedding,
 )
@@ -618,6 +620,70 @@ async def analyze_url(
         embedding_dim=len(embedding),
         linked_to=linked,
         processing_ms=int((time.perf_counter() - t0) * 1000),
+        subject_name=subject_name,
+    )
+
+
+@app.post("/analyze-note", response_model=AnalyzeCaptureResponse,
+          summary="Save a typed/dictated note: extract, embed, link")
+async def analyze_note(
+    req: AnalyzeNoteRequest,
+    user_id: str = Depends(get_current_user),
+) -> AnalyzeCaptureResponse:
+    """Third capture type (besides images and URLs): the user's own note. Runs the
+    same pipeline — faithful extraction, embedding, linking, auto-grouping."""
+    t0 = time.perf_counter()
+    note = req.text.strip()
+    if not note:
+        raise HTTPException(status_code=400, detail="Prázdná poznámka.")
+
+    # Dedup identical notes (normalised) so re-sending the same thought is a no-op.
+    norm = _re.sub(r"\s+", " ", note).lower()
+    note_hash = hashlib.sha256(("note:" + norm).encode()).hexdigest()
+    async with get_session() as session:
+        dup = await (await session.run(Q.GET_CAPTURE_BY_HASH, image_hash=note_hash, uid=user_id)).single()
+        if dup is not None:
+            node = dup["c"]
+            attrs = ExtractedAttributes(title=node.get("title", ""), summary=node.get("summary", ""))
+            return AnalyzeCaptureResponse(
+                capture_id=node["id"], attributes=attrs,
+                embedding_dim=len(node.get("embedding") or []),
+                processing_ms=int((time.perf_counter() - t0) * 1000),
+            )
+
+    try:
+        attributes = extractAttributesFromNote(note)
+    except anthropic.APIError as exc:
+        raise HTTPException(status_code=502, detail=f"Claude API error: {exc}") from exc
+
+    embed_text = f"{attributes.title} {attributes.summary} {' '.join(attributes.topics)}"
+    embedding = getEmbedding(embed_text)
+
+    capture = CaptureNode(image_hash=note_hash, attributes=attributes, embedding=embedding)
+    try:
+        await _persist_capture(capture, user_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Database error: {exc}") from exc
+
+    try:
+        linked = await findSimilarCaptures(capture.id, attributes, embedding)
+        await persistLinks(capture.id, linked)
+    except Exception as exc:
+        logger.warning("Link engine error (non-fatal): %s", exc)
+        linked = []
+
+    subject_name = None
+    try:
+        subject_name = await _auto_group_on_upload(
+            capture.id, attributes.title, attributes.summary,
+            attributes.raw_text, embedding, user_id, source_hint="note",
+        )
+    except Exception as exc:
+        logger.warning("Auto-group on upload failed (non-fatal): %s", exc)
+
+    return AnalyzeCaptureResponse(
+        capture_id=capture.id, attributes=attributes, embedding_dim=len(embedding),
+        linked_to=linked, processing_ms=int((time.perf_counter() - t0) * 1000),
         subject_name=subject_name,
     )
 

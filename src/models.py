@@ -109,6 +109,10 @@ class AnalyzeUrlRequest(BaseModel):
     url: str = Field(..., description="Webová adresa ke zpracování")
 
 
+class AnalyzeNoteRequest(BaseModel):
+    text: str = Field(..., min_length=1, description="Text poznámky / myšlenky")
+
+
 class LinkedCapture(BaseModel):
     capture_id: str
     link_type: LinkType

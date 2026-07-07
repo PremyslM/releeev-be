@@ -242,6 +242,74 @@ word itself into topics."""
     )
 
 
+def extractAttributesFromNote(text: str) -> ExtractedAttributes:
+    """
+    Attributes for the user's OWN note/idea (typed or dictated). Unlike a web
+    page, we stay faithful — extract a title + light summary + topics, never
+    rewrite the thought. The note itself is kept verbatim in `raw_text`.
+    """
+    from src.link_engine import DOMAIN_TOPICS  # local import: avoids any cycle
+
+    client = _claude()
+    allowed = ", ".join(sorted(DOMAIN_TOPICS))
+    note = text.strip()
+
+    prompt = f"""This is the user's OWN short note saved to their second brain.
+Return ONLY valid JSON, no prose. Stay faithful — do NOT rewrite or invent.
+
+Note:
+\"\"\"{note[:4000]}\"\"\"
+
+Return JSON:
+{{
+  "title":    "<3-6 word title capturing the note>",
+  "summary":  "<1-2 sentence faithful gist in the note's language, or the note itself if already short>",
+  "topics":   ["<4-8 specific topic keywords>"],
+  "category": "<exactly ONE of: {allowed}>",
+  "people":   ["<names mentioned, or []>"],
+  "places":   ["<places mentioned, or []>"],
+  "language": "<ISO-639-1 code>",
+  "sentiment":"<positive|negative|neutral>"
+}}
+
+Topics: canonical/standardized; specific over generic; do NOT put the category
+word itself into topics."""
+
+    resp = client.messages.create(
+        model="claude-opus-4-8",
+        max_tokens=600,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = next((b.text for b in resp.content if b.type == "text"), "{}").strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.error("Note attribute JSON parse failed: %s\nRaw: %s", exc, raw[:300])
+        data = {}
+
+    topics = [t for t in data.get("topics", []) if isinstance(t, str)][:15]
+    category = (data.get("category") or "").strip().lower()
+    if category in DOMAIN_TOPICS and category not in [t.lower() for t in topics]:
+        topics.append(category)
+
+    return ExtractedAttributes(
+        title=data.get("title", "") or (note[:40] + ("…" if len(note) > 40 else "")),
+        summary=data.get("summary", "") or note,
+        raw_text=note,                       # keep the user's words verbatim
+        capture_type=CaptureType.document,
+        topics=topics,
+        people=[p for p in data.get("people", []) if isinstance(p, str)][:10],
+        places=[pl for pl in data.get("places", []) if isinstance(pl, str)][:10],
+        language=data.get("language", "en"),
+        sentiment=data.get("sentiment", "neutral"),
+        confidence=0.9,
+    )
+
+
 def getEmbedding(text: str) -> list[float]:
     """
     Generate a 1024-dimensional embedding vector using Voyage AI
