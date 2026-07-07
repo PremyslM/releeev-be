@@ -168,6 +168,8 @@ async def _persist_capture(capture: CaptureNode, user_id: str) -> None:
             sentiment=attrs.sentiment,
             confidence=attrs.confidence,
             capture_type=attrs.capture_type.value,
+            kind=attrs.kind,
+            author=attrs.author,
             created_at=capture.created_at.isoformat(),
             embedding=capture.embedding,
         )
@@ -624,6 +626,31 @@ async def analyze_url(
     )
 
 
+def _context_insight_blocking(title: str, summary: str, kind: str,
+                              neighbours: list[tuple[str, str]]) -> str:
+    """One personalised sentence on how a new capture fits the user's existing
+    brain, grounded in its linked neighbours. Empty when there's nothing to say."""
+    if not neighbours:
+        return ""
+    listing = "\n".join(f"- {t}: {s}"[:200] for t, s in neighbours[:4])
+    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    resp = client.messages.create(
+        model="claude-opus-4-8",
+        max_tokens=120,
+        system=(
+            "You connect a person's new note to their own existing notes. In ONE "
+            "short sentence, in the note's language, say how the new note relates "
+            "to or builds on the related notes — specific and personal, like a "
+            "thoughtful friend who knows their thinking. No preamble. If there is "
+            "no real connection, reply with an empty string."
+        ),
+        messages=[{"role": "user", "content":
+                   f"New {kind or 'note'}: {title} — {summary}\n\n"
+                   f"Related notes already in their brain:\n{listing}"}],
+    )
+    return next((b.text for b in resp.content if b.type == "text"), "").strip().strip('"')
+
+
 @app.post("/analyze-note", response_model=AnalyzeCaptureResponse,
           summary="Save a typed/dictated note: extract, embed, link")
 async def analyze_note(
@@ -681,10 +708,27 @@ async def analyze_note(
     except Exception as exc:
         logger.warning("Auto-group on upload failed (non-fatal): %s", exc)
 
+    # Personalised context: how this note fits the user's own brain (grounded in
+    # its linked neighbours). Stored so the detail view can show it later too.
+    context = ""
+    if linked:
+        try:
+            loop = asyncio.get_running_loop()
+            pairs = [(l.title, l.summary) for l in linked[:4]]
+            context = await loop.run_in_executor(
+                None, _context_insight_blocking,
+                attributes.title, attributes.summary, attributes.kind, pairs,
+            )
+            if context:
+                async with get_session() as s:
+                    await s.run(Q.SET_CAPTURE_CONTEXT, id=capture.id, context=context)
+        except Exception as exc:
+            logger.warning("Context insight failed (non-fatal): %s", exc)
+
     return AnalyzeCaptureResponse(
         capture_id=capture.id, attributes=attributes, embedding_dim=len(embedding),
         linked_to=linked, processing_ms=int((time.perf_counter() - t0) * 1000),
-        subject_name=subject_name,
+        subject_name=subject_name, context=context,
     )
 
 
@@ -718,6 +762,8 @@ async def get_capture(
             topics=[t for t in (record.get("topics") or []) if t],
             people=[p for p in (record.get("people") or []) if p],
             places=[pl for pl in (record.get("places") or []) if pl],
+            kind=node.get("kind", "") or "",
+            author=node.get("author", "") or "",
             extra={"url": node["url"]} if node.get("url") else {},
         )
         capture = CaptureNode(
@@ -790,7 +836,8 @@ async def get_capture(
             )
 
     return CaptureDetailResponse(capture=capture, connections=connections,
-                                 subject=subject, location=location)
+                                 subject=subject, location=location,
+                                 context=node.get("context", "") or "")
 
 
 # ── Entity navigation (browsable hubs) ───────────────────────────────────────

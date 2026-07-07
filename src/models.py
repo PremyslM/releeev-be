@@ -41,6 +41,8 @@ class ExtractedAttributes(BaseModel):
     language: str = "en"
     sentiment: str = "neutral"          # positive / negative / neutral
     confidence: float = 1.0             # extraction confidence 0-1
+    kind: str = ""                      # idea | quote | task | fact | question | note | link
+    author: str = ""                    # for quotes: who said it, if known
     extra: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -129,6 +131,7 @@ class AnalyzeCaptureResponse(BaseModel):
     linked_to: list[LinkedCapture] = Field(default_factory=list)
     processing_ms: int = 0
     subject_name: str | None = None  # set if auto-grouped into a Subject branch
+    context: str = ""                # personalised insight: how it fits your brain
 
 
 class SubjectSibling(BaseModel):
@@ -159,6 +162,7 @@ class CaptureDetailResponse(BaseModel):
     connections: list[CaptureLink] = Field(default_factory=list)
     subject: SubjectInfo | None = None
     location: LocationInfo | None = None
+    context: str = ""                # personalised insight: how it fits your brain
 
 
 class SearchResult(BaseModel):

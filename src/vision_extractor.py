@@ -264,6 +264,8 @@ Return JSON:
 {{
   "title":    "<3-6 word title capturing the note>",
   "summary":  "<1-2 sentence faithful gist in the note's language, or the note itself if already short>",
+  "kind":     "<one of: quote|idea|task|fact|question|note>",
+  "author":   "<if kind=quote and an author is stated/known, their name; else empty>",
   "topics":   ["<4-8 specific topic keywords>"],
   "category": "<exactly ONE of: {allowed}>",
   "people":   ["<names mentioned, or []>"],
@@ -272,6 +274,9 @@ Return JSON:
   "sentiment":"<positive|negative|neutral>"
 }}
 
+kind: pick "quote" only if the note is a quotation/aphorism (often in quotes or
+attributed to someone); "task" if it's a to-do; "question" if it's an open
+question; "fact" for a factual snippet; else "idea" or "note".
 Topics: canonical/standardized; specific over generic; do NOT put the category
 word itself into topics."""
 
@@ -296,6 +301,10 @@ word itself into topics."""
     if category in DOMAIN_TOPICS and category not in [t.lower() for t in topics]:
         topics.append(category)
 
+    kind = (data.get("kind") or "note").strip().lower()
+    if kind not in {"quote", "idea", "task", "fact", "question", "note"}:
+        kind = "note"
+
     return ExtractedAttributes(
         title=data.get("title", "") or (note[:40] + ("…" if len(note) > 40 else "")),
         summary=data.get("summary", "") or note,
@@ -306,6 +315,8 @@ word itself into topics."""
         places=[pl for pl in data.get("places", []) if isinstance(pl, str)][:10],
         language=data.get("language", "en"),
         sentiment=data.get("sentiment", "neutral"),
+        kind=kind,
+        author=(data.get("author") or "").strip() if kind == "quote" else "",
         confidence=0.9,
     )
 
