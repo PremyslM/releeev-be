@@ -475,6 +475,24 @@ def _url_slug_text(url: str) -> str:
     return _re.sub(r"\s+", " ", _re.sub(r"[-_+]+", " ", slug)).strip()
 
 
+def _youtube_content(html: str) -> str:
+    """Pull the video title + full description out of a YouTube watch page.
+    The description lives in `ytInitialPlayerResponse` (JSON), not the visible
+    HTML, so the generic text scrape misses it."""
+    import json as _json
+    out = []
+    tm = _re.search(r'"title":\s*"((?:\\.|[^"\\])*)"', html)
+    dm = _re.search(r'"shortDescription":\s*"((?:\\.|[^"\\])*)"', html)
+    for m in (tm, dm):
+        if not m:
+            continue
+        try:
+            out.append(_json.loads('"' + m.group(1) + '"'))
+        except Exception:  # noqa: BLE001
+            out.append(m.group(1).encode().decode("unicode_escape", "ignore"))
+    return "\n\n".join(t for t in out if t).strip()
+
+
 async def _fetch_page(url: str) -> tuple[dict, str]:
     """Fetch a page with realistic browser headers (avoids most bot-blocking 403s)."""
     import httpx
@@ -493,7 +511,14 @@ async def _fetch_page(url: str) -> tuple[dict, str]:
     async with httpx.AsyncClient(follow_redirects=True, timeout=15.0, headers=headers) as client:
         resp = await client.get(url)
         resp.raise_for_status()
-        return _parse_html(resp.text)
+        signals, text = _parse_html(resp.text)
+        # YouTube renders content client-side; lift the real title + description
+        # from the embedded JSON so the model has something substantial to work on.
+        if _re.search(r"(?:^|\.)(youtube\.com|youtu\.be)", url, _re.I):
+            yt = _youtube_content(resp.text)
+            if yt:
+                text = (yt + "\n\n" + text)[:8000]
+        return signals, text
 
 
 @app.post("/analyze-url", response_model=AnalyzeCaptureResponse,

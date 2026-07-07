@@ -39,13 +39,12 @@ def _voyage() -> voyageai.Client:
 # ── Extraction prompt ─────────────────────────────────────────────────────────
 
 _SYSTEM = """You are an intelligent capture analyser for a second-brain app.
-Your job: look at the provided image and return a strict JSON object with the
-following fields (all required):
+Look at the image and return a strict JSON object with these fields (all required):
 
 {
-  "title":        "<short descriptive title>",
-  "summary":      "<2-3 sentence summary of the content>",
-  "raw_text":     "<all readable text extracted verbatim, or empty string>",
+  "title":        "<short, specific title of WHAT this is>",
+  "summary":      "<the takeaway — see rules>",
+  "raw_text":     "<readable text transcribed verbatim, or empty string>",
   "capture_type": "<one of: screenshot|photo|document|unknown>",
   "topics":       ["<keyword1>", ...],
   "category":     "<exactly ONE broad domain category from the allowed list>",
@@ -55,6 +54,15 @@ following fields (all required):
   "sentiment":    "<positive|negative|neutral>",
   "confidence":   <float 0.0-1.0 representing your extraction confidence>
 }
+
+SUMMARY RULES — this is the important part:
+- Do NOT describe what is visibly in the picture; the user already saw it.
+  Never write "a photo of…", "the image shows…", "a screenshot of…".
+- Instead, infer and state what it MEANS or what it's FOR: the point, the
+  decision, the fact worth remembering, the conclusion. Be concise (1–3 sentences).
+- If it identifies a real thing (a product, place, dish, document), name it and
+  give the useful gist (e.g. what it is, key spec/price/where), not its looks.
+- For a document/screenshot with text, summarise the substance, not the layout.
 
 Respond with ONLY valid JSON — no markdown fences, no prose.
 """
@@ -166,18 +174,18 @@ def extractAttributesFromText(
     sig_lines = "\n".join(f"{k}: {v}" for k, v in signals.items() if v)
     allowed = ", ".join(sorted(DOMAIN_TOPICS))
 
-    prompt = f"""Analyse this web page and return ONLY valid JSON, no prose.
+    prompt = f"""Analyse this web page / video and return ONLY valid JSON, no prose.
 
 URL: {url}
 {sig_lines}
 
-Page text (truncated):
-{text[:3500]}
+Content (truncated):
+{text[:6000]}
 
 Return JSON:
 {{
-  "title":    "<concise descriptive title>",
-  "summary":  "<2-3 sentence summary of the page>",
+  "title":    "<concise, specific title of what this is>",
+  "summary":  "<a genuinely useful synthesis — see rules>",
   "topics":   ["<6-10 specific English topic keywords>"],
   "category": "<exactly ONE of: {allowed}>",
   "people":   ["<real person names, or []>"],
@@ -186,12 +194,22 @@ Return JSON:
   "sentiment":"<positive|negative|neutral>"
 }}
 
-Rules: canonical/standardized topics; specific over generic; do NOT put the
-category word itself into topics."""
+SUMMARY RULES — extract what's worth keeping, don't just describe the page:
+- Adapt the shape to the content:
+  • Recipe → an "Ingredients:" bulleted list, then numbered "Steps:".
+  • How-to / tutorial → the key steps or takeaways as a short list.
+  • Product → what it is + key specs / price as a few bullets.
+  • Article / video → 3-6 bullet key points or conclusions.
+- Write it in the content's own language. Draw conclusions; be concrete and
+  skimmable. Use plain bullets ("- ") and "1." numbering, short lines. Keep it
+  tight — no fluff, no "this page shows…".
+
+Topics: canonical/standardized; specific over generic; do NOT put the category
+word itself into topics."""
 
     resp = client.messages.create(
         model="claude-opus-4-8",
-        max_tokens=800,
+        max_tokens=1400,
         messages=[{"role": "user", "content": prompt}],
     )
     raw = next((b.text for b in resp.content if b.type == "text"), "{}").strip()
