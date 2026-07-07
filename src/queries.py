@@ -115,9 +115,16 @@ SET   c.user_id      = $user_id,
       c.sentiment    = $sentiment,
       c.confidence   = $confidence,
       c.capture_type = $capture_type,
+      c.kind         = $kind,
+      c.author       = $author,
       c.created_at   = datetime($created_at),
       c.embedding    = $embedding
 RETURN c
+"""
+
+SET_CAPTURE_CONTEXT = """
+MATCH (c:Capture {id: $id})
+SET c.context = $context
 """
 
 # Assign all still-unowned captures to a user (one-off migration).
