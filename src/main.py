@@ -413,6 +413,11 @@ async def analyze_capture(
     except Exception as exc:
         logger.warning("Auto-group on upload failed (non-fatal): %s", exc)
 
+    context = await _attach_context(
+        capture.id, attributes.kind or "photo", attributes.title, attributes.summary,
+        attributes.raw_text, linked, user_id,
+    )
+
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
 
     return AnalyzeCaptureResponse(
@@ -422,6 +427,7 @@ async def analyze_capture(
         linked_to=linked,
         processing_ms=elapsed_ms,
         subject_name=subject_name,
+        context=context,
     )
 
 
@@ -616,6 +622,11 @@ async def analyze_url(
     except Exception as exc:
         logger.warning("Auto-group on upload failed (non-fatal): %s", exc)
 
+    context = await _attach_context(
+        capture.id, "link", attributes.title, attributes.summary,
+        attributes.summary, linked, user_id,
+    )
+
     return AnalyzeCaptureResponse(
         capture_id=capture.id,
         attributes=attributes,
@@ -623,32 +634,58 @@ async def analyze_url(
         linked_to=linked,
         processing_ms=int((time.perf_counter() - t0) * 1000),
         subject_name=subject_name,
+        context=context,
     )
 
 
-def _context_insight_blocking(title: str, summary: str, kind: str,
-                              neighbours: list[tuple[str, str]]) -> str:
-    """One personalised sentence on how a new capture fits the user's existing
-    brain, grounded in its linked neighbours. Empty when there's nothing to say."""
+def _contextual_summary_blocking(kind: str, title: str, summary: str, content: str,
+                                 neighbours: list[tuple[str, str]]) -> str:
+    """A short 'in context of your brain' summary that weaves in how this capture
+    connects to the user's related saved items. Markdown (bold + '-' bullets)."""
     if not neighbours:
         return ""
-    listing = "\n".join(f"- {t}: {s}"[:200] for t, s in neighbours[:4])
+    listing = "\n".join(f"- {t}: {s}"[:220] for t, s in neighbours[:5])
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
     resp = client.messages.create(
         model="claude-opus-4-8",
-        max_tokens=120,
+        max_tokens=500,
         system=(
-            "You connect a person's new note to their own existing notes. In ONE "
-            "short sentence, in the note's language, say how the new note relates "
-            "to or builds on the related notes — specific and personal, like a "
-            "thoughtful friend who knows their thinking. No preamble. If there is "
-            "no real connection, reply with an empty string."
+            "You write a short 'in context' summary for something a person just "
+            "saved to their second brain. You get the item plus the related items "
+            "already in their brain. Write 1-2 short paragraphs, in the item's "
+            "language, that: (1) give the gist of the item concisely; (2) WEAVE IN "
+            "how it connects to their related saved items, naming them naturally "
+            "(e.g. 'your dream X you saved', 'the Y you noted via a screenshot'); "
+            "(3) may add 2-4 genuinely useful extra tips as '- ' bullet lines when "
+            "it helps. Use **bold** for the few most important phrases. Concrete, "
+            "warm, skimmable. No preamble like 'this shows'."
         ),
         messages=[{"role": "user", "content":
-                   f"New {kind or 'note'}: {title} — {summary}\n\n"
-                   f"Related notes already in their brain:\n{listing}"}],
+                   f"New {kind or 'item'}: {title}\nGist: {summary}\n"
+                   f"{('Content: ' + content[:1200]) if content else ''}\n\n"
+                   f"Related items already in their brain:\n{listing}"}],
     )
-    return next((b.text for b in resp.content if b.type == "text"), "").strip().strip('"')
+    return next((b.text for b in resp.content if b.type == "text"), "").strip()
+
+
+async def _attach_context(capture_id: str, kind: str, title: str, summary: str,
+                          content: str, linked: list, user_id: str) -> str:
+    """Generate + store the personalised contextual summary for a capture that
+    linked to related notes. Non-fatal; returns '' when there's nothing to add."""
+    if not linked:
+        return ""
+    try:
+        loop = asyncio.get_running_loop()
+        pairs = [(l.title, l.summary) for l in linked[:5]]
+        ctx = await loop.run_in_executor(
+            None, _contextual_summary_blocking, kind, title, summary, content, pairs)
+        if ctx:
+            async with get_session() as s:
+                await s.run(Q.SET_CAPTURE_CONTEXT, id=capture_id, context=ctx)
+        return ctx
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Context summary failed (non-fatal): %s", exc)
+        return ""
 
 
 @app.post("/analyze-note", response_model=AnalyzeCaptureResponse,
@@ -708,22 +745,11 @@ async def analyze_note(
     except Exception as exc:
         logger.warning("Auto-group on upload failed (non-fatal): %s", exc)
 
-    # Personalised context: how this note fits the user's own brain (grounded in
-    # its linked neighbours). Stored so the detail view can show it later too.
-    context = ""
-    if linked:
-        try:
-            loop = asyncio.get_running_loop()
-            pairs = [(l.title, l.summary) for l in linked[:4]]
-            context = await loop.run_in_executor(
-                None, _context_insight_blocking,
-                attributes.title, attributes.summary, attributes.kind, pairs,
-            )
-            if context:
-                async with get_session() as s:
-                    await s.run(Q.SET_CAPTURE_CONTEXT, id=capture.id, context=context)
-        except Exception as exc:
-            logger.warning("Context insight failed (non-fatal): %s", exc)
+    # Personalised summary in the context of the user's own brain.
+    context = await _attach_context(
+        capture.id, attributes.kind, attributes.title, attributes.summary,
+        attributes.raw_text, linked, user_id,
+    )
 
     return AnalyzeCaptureResponse(
         capture_id=capture.id, attributes=attributes, embedding_dim=len(embedding),
