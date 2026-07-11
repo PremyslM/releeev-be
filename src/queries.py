@@ -440,6 +440,24 @@ RETURN l.name AS name, l.locality AS locality, l.lat AS lat, l.lon AS lon, count
 ORDER BY cnt DESC, name ASC LIMIT $limit
 """
 
+# ── Journal (captures grouped by day) ────────────────────────────────────────
+LIST_JOURNAL_DAYS = """
+MATCH (c:Capture)
+WHERE c.user_id = $uid AND c.created_at IS NOT NULL
+WITH date(c.created_at) AS d, count(c) AS n, collect(c.title) AS titles
+RETURN toString(d) AS date, n AS count,
+       head([t IN titles WHERE t IS NOT NULL AND t <> ""]) AS preview
+ORDER BY d DESC LIMIT $limit
+"""
+
+GET_DAY_CAPTURES = """
+MATCH (c:Capture)
+WHERE c.user_id = $uid AND c.created_at IS NOT NULL AND date(c.created_at) = date($d)
+RETURN c.id AS id, c.title AS title, c.summary AS summary,
+       c.capture_type AS capture_type, c.kind AS kind, c.created_at AS created_at
+ORDER BY c.created_at ASC
+"""
+
 # Captures made at the same venue (feeds the CO_LOCATED / same_place link signal).
 LOCATION_MATCH = """
 MATCH (c:Capture {id: $capture_id})-[:AT_LOCATION]->(l:Location)<-[:AT_LOCATION]-(other:Capture)

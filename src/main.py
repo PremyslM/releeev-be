@@ -50,6 +50,10 @@ from src.models import (
     EntityDetailResponse,
     EntityListResponse,
     EntityRef,
+    JournalCapture,
+    JournalDay,
+    JournalDayList,
+    JournalEntry,
     LocationListResponse,
     LocationSummary,
     SearchResponse,
@@ -1009,6 +1013,95 @@ async def list_locations(
             async for r in rec
         ]
     return LocationListResponse(locations=locs)
+
+
+# ── Journal (captures grouped by day, with an AI-written daily entry) ─────────
+
+_JOURNAL_CACHE: dict[tuple[str, str], tuple[int, str]] = {}   # (uid,date) → (count, entry)
+
+
+def _journal_entry_blocking(date: str, items: list[tuple[str, str, str, str]]) -> str:
+    """Write a short, warm journal entry organising a day's captures. Each item
+    is (capture_type, kind, title, summary). Markdown; the user's language."""
+    if not items:
+        return ""
+    lines = "\n".join(
+        f"- [{ct or 'note'}{('/' + kind) if kind else ''}] {title}: {summary}"[:240]
+        for ct, kind, title, summary in items
+    )
+    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    resp = client.messages.create(
+        model="claude-opus-4-8",
+        max_tokens=600,
+        system=(
+            "You are the user's journal writer. Given everything they captured on "
+            "a day (photos, notes, saved links), write a short, warm journal entry "
+            "for that day IN THEIR LANGUAGE. Organise it naturally under what fits: "
+            "what they did / experienced, what they seem proud of or enjoyed, and "
+            "anything they're planning next. Use light Markdown — a few **bold** "
+            "phrases and short '- ' bullets. Be personal and concrete, never generic; "
+            "don't invent things that aren't in the captures. 3-6 sentences or a few "
+            "bullets is plenty."
+        ),
+        messages=[{"role": "user", "content": f"Date: {date}\nCaptures that day:\n{lines}"}],
+    )
+    return next((b.text for b in resp.content if b.type == "text"), "").strip()
+
+
+@app.get("/journal", response_model=JournalDayList,
+         summary="Days that have captures — the journal's table of contents")
+async def list_journal(
+    limit: int = Query(default=120, ge=1, le=400),
+    user_id: str = Depends(get_current_user),
+) -> JournalDayList:
+    async with get_session() as s:
+        rec = await s.run(Q.LIST_JOURNAL_DAYS, uid=user_id, limit=limit)
+        days = [
+            JournalDay(date=r["date"], count=r["count"], preview=r["preview"] or "")
+            async for r in rec
+        ]
+    return JournalDayList(days=days)
+
+
+@app.get("/journal/{date}", response_model=JournalEntry,
+         summary="A single day: its captures + an AI-written journal entry")
+async def journal_day(
+    date: str,
+    user_id: str = Depends(get_current_user),
+) -> JournalEntry:
+    if not _re.match(r"^\d{4}-\d{2}-\d{2}$", date):
+        raise HTTPException(status_code=400, detail="Datum musí být ve tvaru YYYY-MM-DD.")
+
+    async with get_session() as s:
+        rec = await s.run(Q.GET_DAY_CAPTURES, uid=user_id, d=date)
+        rows = [r async for r in rec]
+
+    captures = [
+        JournalCapture(
+            capture_id=r["id"], title=r["title"] or "", summary=r["summary"] or "",
+            capture_type=r["capture_type"] or "", kind=r["kind"] or "",
+            created_at=_to_native(r["created_at"]),
+        )
+        for r in rows
+    ]
+    if not captures:
+        return JournalEntry(date=date, entry="", captures=[])
+
+    # Cache the AI entry per day; recompute when that day gains captures.
+    cached = _JOURNAL_CACHE.get((user_id, date))
+    if cached and cached[0] == len(captures):
+        return JournalEntry(date=date, entry=cached[1], captures=captures)
+
+    items = [(c.capture_type, c.kind, c.title, c.summary) for c in captures]
+    try:
+        loop = asyncio.get_running_loop()
+        entry = await loop.run_in_executor(None, _journal_entry_blocking, date, items)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Journal entry generation failed (non-fatal): %s", exc)
+        entry = ""
+    if entry:
+        _JOURNAL_CACHE[(user_id, date)] = (len(captures), entry)
+    return JournalEntry(date=date, entry=entry, captures=captures)
 
 
 @app.get("/entities/{kind}/{name}", response_model=EntityDetailResponse,
