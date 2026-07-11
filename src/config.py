@@ -14,6 +14,12 @@ class Settings(BaseSettings):
 
     # Anthropic
     anthropic_api_key: str = ""
+    # Model routing to control token cost. `claude_model` (capable) is used only
+    # where quality matters — image understanding, the contextual insight, and the
+    # RAG answer. Everything else (extraction, expansion, themes, journal) uses the
+    # much cheaper `claude_model_fast`.
+    claude_model: str = "claude-sonnet-5"
+    claude_model_fast: str = "claude-haiku-4-5-20251001"
 
     # Voyage AI (embeddings) — get free key at https://dash.voyageai.com/
     # Falls back to anthropic_api_key if not set (for Anthropic customers)
