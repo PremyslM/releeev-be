@@ -257,6 +257,33 @@ class EntityDetailResponse(BaseModel):
     related: list[EntityRef] = Field(default_factory=list)
 
 
+class JournalDay(BaseModel):
+    """One day that has captures — a page in the journal."""
+    date: str            # YYYY-MM-DD
+    count: int = 0
+    preview: str = ""    # short label (e.g. first/representative capture title)
+
+
+class JournalDayList(BaseModel):
+    days: list[JournalDay] = Field(default_factory=list)
+
+
+class JournalCapture(BaseModel):
+    capture_id: str
+    title: str = ""
+    summary: str = ""
+    capture_type: str = ""
+    kind: str = ""
+    created_at: datetime | None = None
+
+
+class JournalEntry(BaseModel):
+    """A day's captures plus an AI-organised journal write-up of that day."""
+    date: str
+    entry: str = ""      # AI narrative (markdown), organised: did / proud of / next
+    captures: list[JournalCapture] = Field(default_factory=list)
+
+
 class LocationSummary(BaseModel):
     """A place where captures were made — a memory hub."""
     name: str
