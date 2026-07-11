@@ -60,6 +60,9 @@ class Settings(BaseSettings):
     cosine_similarity_threshold: float = 0.65
     temporal_proximity_days: int = 90
     link_strength_min: float = 0.25
+    # Cap on how many links a single capture keeps (its strongest) — keeps the
+    # graph sparse and readable instead of a fully-connected hairball.
+    max_links_per_capture: int = 6
 
     # ── Environment helpers ──────────────────────────────────────────────────
     @property
