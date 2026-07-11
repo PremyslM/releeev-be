@@ -163,6 +163,23 @@ _W = {
 }
 
 
+# A link must be *earned* by a specific, meaningful signal — not by weak
+# commonality alone (same broad category, same place/time/source). Otherwise
+# everything links to everything and the graph becomes a meaningless hairball.
+_MEANINGFUL_SEMANTIC = 0.72   # embedding this high ⇒ genuinely about the same thing
+
+
+def _has_specific_anchor(ev: "_Evidence") -> bool:
+    """True if the pair shares a concrete reason to be linked — a specific topic,
+    a named entity/brand, or strong semantic similarity. Weak-only evidence
+    (broad category, same place/time/source) does NOT qualify."""
+    return bool(
+        ev.specific_topics
+        or ev.shared_entities
+        or ev.embedding_sim >= _MEANINGFUL_SEMANTIC
+    )
+
+
 def _score_evidence(ev: _Evidence, threshold: float) -> tuple[float, LinkType, list[str]]:
     """
     Combine all of a candidate's evidence into (confidence, display_type, reasons).
@@ -335,6 +352,11 @@ async def findSimilarCaptures(
     min_strength = settings.link_strength_min
     links: list[LinkedCapture] = []
     for e in evidence.values():
+        # Gate: skip links that rest ONLY on weak commonality (same category /
+        # place / time / source). A link must have a concrete anchor so the graph
+        # shows genuine, intelligible connections instead of a hairball.
+        if not _has_specific_anchor(e):
+            continue
         score, display_type, reasons = _score_evidence(e, threshold)
         if score < min_strength:
             continue
@@ -349,8 +371,10 @@ async def findSimilarCaptures(
             )
         )
 
+    # Keep only each capture's strongest, most-specific links — no node becomes a
+    # hub of dozens of weak edges.
     links.sort(key=lambda x: x.strength, reverse=True)
-    return links[:limit]
+    return links[: settings.max_links_per_capture]
 
 
 # ── Persist links ─────────────────────────────────────────────────────────────
