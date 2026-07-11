@@ -651,7 +651,7 @@ def _contextual_summary_blocking(kind: str, title: str, summary: str, content: s
     listing = "\n".join(f"- {t}: {s}"[:220] for t, s in neighbours[:5])
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
     resp = client.messages.create(
-        model="claude-opus-4-8",
+        model=settings.claude_model,
         max_tokens=500,
         system=(
             "You write a short 'in context' summary for something a person just "
@@ -914,7 +914,7 @@ def _distill_themes_blocking(topics: list[tuple[str, int]]) -> list[dict]:
     listing = "\n".join(f"- {name} ({cnt})" for name, cnt in topics)
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
     resp = client.messages.create(
-        model="claude-opus-4-8",
+        model=settings.claude_model_fast,
         max_tokens=700,
         system=(
             "You organise a personal knowledge base. Given its topics with "
@@ -1031,7 +1031,7 @@ def _journal_entry_blocking(date: str, items: list[tuple[str, str, str, str]]) -
     )
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
     resp = client.messages.create(
-        model="claude-opus-4-8",
+        model=settings.claude_model_fast,
         max_tokens=600,
         system=(
             "You are the user's journal writer. Given everything they captured on "
@@ -1041,7 +1041,8 @@ def _journal_entry_blocking(date: str, items: list[tuple[str, str, str, str]]) -
             "anything they're planning next. Use light Markdown — a few **bold** "
             "phrases and short '- ' bullets. Be personal and concrete, never generic; "
             "don't invent things that aren't in the captures. 3-6 sentences or a few "
-            "bullets is plenty."
+            "bullets is plenty. Do NOT start with the date or a '#' heading — the app "
+            "already shows the date."
         ),
         messages=[{"role": "user", "content": f"Date: {date}\nCaptures that day:\n{lines}"}],
     )
@@ -1151,7 +1152,7 @@ def _expand_query_with_claude(q: str) -> str:
     try:
         client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
         response = client.messages.create(
-            model="claude-opus-4-8",
+            model=settings.claude_model_fast,
             max_tokens=80,
             system=(
                 "You expand short search queries for a knowledge graph. "
@@ -1452,7 +1453,7 @@ def _ask_claude(question: str, context: str) -> str:
         "neobsahují, jasně to řekni a nic si nevymýšlej."
     )
     resp = client.messages.create(
-        model="claude-opus-4-8",
+        model=settings.claude_model,
         max_tokens=600,
         system=system,
         messages=[{"role": "user", "content": f"Otázka: {question}\n\nZdroje z mozku:\n{context}"}],
@@ -1591,7 +1592,7 @@ Rules for topics:
 
     try:
         resp = client.messages.create(
-            model="claude-opus-4-8",
+            model=settings.claude_model_fast,
             max_tokens=300,
             messages=[{"role": "user", "content": prompt}],
         )

@@ -75,8 +75,8 @@ def extractAttributes(
     mime_type: str = "image/jpeg",
 ) -> ExtractedAttributes:
     """
-    Send an image to Claude claude-opus-4-8 via the Vision API and parse the
-    structured JSON response into an ExtractedAttributes object.
+    Send an image to Claude (settings.claude_model) via the Vision API and parse
+    the structured JSON response into an ExtractedAttributes object.
     """
     from src.link_engine import DOMAIN_TOPICS  # local import: avoids any cycle
 
@@ -85,7 +85,7 @@ def extractAttributes(
     allowed = ", ".join(sorted(DOMAIN_TOPICS))
 
     response = client.messages.create(
-        model="claude-opus-4-8",
+        model=settings.claude_model,
         max_tokens=2048,
         system=_SYSTEM,
         messages=[
@@ -208,7 +208,7 @@ Topics: canonical/standardized; specific over generic; do NOT put the category
 word itself into topics."""
 
     resp = client.messages.create(
-        model="claude-opus-4-8",
+        model=settings.claude_model_fast,
         max_tokens=1400,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -281,7 +281,7 @@ Topics: canonical/standardized; specific over generic; do NOT put the category
 word itself into topics."""
 
     resp = client.messages.create(
-        model="claude-opus-4-8",
+        model=settings.claude_model_fast,
         max_tokens=600,
         messages=[{"role": "user", "content": prompt}],
     )
