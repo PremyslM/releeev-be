@@ -1041,7 +1041,8 @@ def _journal_entry_blocking(date: str, items: list[tuple[str, str, str, str]]) -
             "anything they're planning next. Use light Markdown — a few **bold** "
             "phrases and short '- ' bullets. Be personal and concrete, never generic; "
             "don't invent things that aren't in the captures. 3-6 sentences or a few "
-            "bullets is plenty."
+            "bullets is plenty. Do NOT start with the date or a '#' heading — the app "
+            "already shows the date."
         ),
         messages=[{"role": "user", "content": f"Date: {date}\nCaptures that day:\n{lines}"}],
     )
