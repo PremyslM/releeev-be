@@ -247,9 +247,12 @@ word itself into topics.{_lang_instruction(lang) or ' Write title and summary in
         topics.append(category)
 
     return ExtractedAttributes(
+        # A web page's own value lives in the synthesized summary + the reopenable
+        # link — not the raw scrape, which is site chrome + boilerplate. Storing it
+        # as raw_text just surfaces a confusing "Notes" dump, so we leave it empty.
         title=data.get("title", "") or (signals.get("og:title") or signals.get("page title") or url),
         summary=data.get("summary", ""),
-        raw_text=text[:2000],
+        raw_text="",
         capture_type=CaptureType.document,
         topics=topics,
         people=[p for p in data.get("people", []) if isinstance(p, str)][:10],

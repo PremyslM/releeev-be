@@ -437,8 +437,80 @@ async def analyze_capture(
 
 # ── Analyze a URL (link upload) ───────────────────────────────────────────────
 
+# Site "chrome" that pollutes a scrape: navigation, menus, headers, footers,
+# sidebars, forms, scripts. Dropped whole (with contents) before flattening so
+# the model — and the stored text — see the article, not the menu.
+_CHROME_TAGS = (
+    "script", "style", "noscript", "nav", "header", "footer", "aside",
+    "form", "svg", "button", "select", "template", "dialog", "iframe",
+)
+
+
+def _jsonld_content(html: str) -> str:
+    """Clean recipe/article text from schema.org JSON-LD, when the page ships it.
+
+    Recipe JSON-LD carries `recipeIngredient` (already "500 g potatoes") and
+    `recipeInstructions` — far cleaner than scraping the rendered page, and it
+    gives us ingredient amounts for free. Returns "" when there's no usable
+    structured data."""
+    import json as _json
+
+    def walk(obj):
+        """Yield every dict in a nested JSON-LD structure (@graph, arrays)."""
+        if isinstance(obj, dict):
+            yield obj
+            for v in obj.values():
+                yield from walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                yield from walk(v)
+
+    def types(node) -> set[str]:
+        t = node.get("@type", "")
+        return {t.lower()} if isinstance(t, str) else {str(x).lower() for x in t}
+
+    def as_text(step) -> str:
+        if isinstance(step, str):
+            return step.strip()
+        if isinstance(step, dict):
+            return (step.get("text") or step.get("name") or "").strip()
+        return ""
+
+    for block in _re.findall(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html, _re.I | _re.S,
+    ):
+        try:
+            data = _json.loads(block.strip())
+        except (_json.JSONDecodeError, ValueError):
+            continue
+        for node in walk(data):
+            if not isinstance(node, dict):
+                continue
+            if "recipe" in types(node):
+                parts = []
+                if node.get("name"):
+                    parts.append(str(node["name"]).strip())
+                if node.get("description"):
+                    parts.append(str(node["description"]).strip())
+                ings = [str(i).strip() for i in node.get("recipeIngredient", []) if str(i).strip()]
+                if ings:
+                    parts.append("Ingredients:\n" + "\n".join(f"- {i}" for i in ings))
+                steps = [as_text(s) for s in node.get("recipeInstructions", [])]
+                steps = [s for s in steps if s]
+                if steps:
+                    parts.append("Steps:\n" + "\n".join(f"{n}. {s}" for n, s in enumerate(steps, 1)))
+                if ings or steps:
+                    return "\n\n".join(parts).strip()
+    return ""
+
+
 def _parse_html(html: str) -> tuple[dict, str]:
-    """Extract title/OG/meta signals and a cleaned text dump from raw HTML."""
+    """Extract title/OG/meta signals and a cleaned text dump from raw HTML.
+
+    Prefers structured data (JSON-LD recipe/article) and the main content
+    region, and strips site chrome (nav/menu/header/footer) so the result is the
+    article — not the surrounding navigation."""
     def meta(prop: str, attr: str = "property") -> str:
         m = _re.search(
             rf'<meta[^>]+{attr}=["\']{_re.escape(prop)}["\'][^>]+content=["\']([^"\']+)',
@@ -458,10 +530,28 @@ def _parse_html(html: str) -> tuple[dict, str]:
         "description": meta("description", attr="name"),
     }
 
-    text = _re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", html, flags=_re.I | _re.S)
-    text = _re.sub(r"<[^>]+>", " ", text)
+    # 1) Best case: clean structured data (recipe ingredients+steps, etc.).
+    structured = _jsonld_content(html)
+
+    # 2) Otherwise flatten the page, but first drop chrome and prefer the main
+    #    content region so menus/sidebars don't drown the article.
+    body = html
+    for tag in _CHROME_TAGS:
+        body = _re.sub(rf"<{tag}\b[^>]*>.*?</{tag}>", " ", body, flags=_re.I | _re.S)
+    main_m = (
+        _re.search(r"<main\b[^>]*>(.*?)</main>", body, _re.I | _re.S)
+        or _re.search(r"<article\b[^>]*>(.*?)</article>", body, _re.I | _re.S)
+    )
+    if main_m and len(main_m.group(1)) > 400:
+        body = main_m.group(1)
+
+    text = _re.sub(r"<[^>]+>", " ", body)
     text = _re.sub(r"&(nbsp|amp|quot|#39|lt|gt);", " ", text)
     text = _re.sub(r"\s+", " ", text).strip()
+
+    # Lead with the structured content when we have it — it's the cleanest signal.
+    if structured:
+        text = (structured + "\n\n" + text)[:8000]
     return signals, text
 
 
