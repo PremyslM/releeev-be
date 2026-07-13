@@ -105,14 +105,17 @@ class AnalyzeCaptureRequest(BaseModel):
     place: str | None = None        # e.g. "Kavárna 14g"
     locality: str | None = None     # e.g. "Mariánské Lázně"
     captured_at: str | None = None  # real capture time (ISO), distinct from upload
+    lang: str = ""                  # device language ISO code — write records in it
 
 
 class AnalyzeUrlRequest(BaseModel):
     url: str = Field(..., description="Webová adresa ke zpracování")
+    lang: str = ""                  # device language ISO code
 
 
 class AnalyzeNoteRequest(BaseModel):
     text: str = Field(..., min_length=1, description="Text poznámky / myšlenky")
+    lang: str = ""                  # device language ISO code
 
 
 class LinkedCapture(BaseModel):

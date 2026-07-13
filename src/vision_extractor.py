@@ -68,11 +68,23 @@ Respond with ONLY valid JSON — no markdown fences, no prose.
 """
 
 
+def _lang_instruction(lang: str) -> str:
+    """Ask the model to write the human-facing fields in the device language,
+    while topics stay canonical English (so related captures share keywords)."""
+    lang = (lang or "").strip()
+    if not lang:
+        return ""
+    return (f' IMPORTANT: write "title" and "summary" in the user\'s language '
+            f'(ISO code "{lang}"), even if the source content is in another '
+            f'language. Keep "topics" in canonical English.')
+
+
 # ── Main functions ────────────────────────────────────────────────────────────
 
 def extractAttributes(
     image_base64: str,
     mime_type: str = "image/jpeg",
+    lang: str = "",
 ) -> ExtractedAttributes:
     """
     Send an image to Claude (settings.claude_model) via the Vision API and parse
@@ -107,6 +119,7 @@ def extractAttributes(
                             f'The "category" must be exactly ONE of: {allowed}. '
                             "Pick the closest one even for photos (e.g. a car photo → "
                             "automotive). Do NOT put the category word itself into topics."
+                            + _lang_instruction(lang)
                         ),
                     },
                 ],
@@ -159,7 +172,7 @@ def extractAttributes(
 
 
 def extractAttributesFromText(
-    text: str, url: str = "", signals: dict | None = None
+    text: str, url: str = "", signals: dict | None = None, lang: str = ""
 ) -> ExtractedAttributes:
     """
     Build structured attributes from a web page's text (instead of an image).
@@ -200,12 +213,11 @@ SUMMARY RULES — extract what's worth keeping, don't just describe the page:
   • How-to / tutorial → the key steps or takeaways as a short list.
   • Product → what it is + key specs / price as a few bullets.
   • Article / video → 3-6 bullet key points or conclusions.
-- Write it in the content's own language. Draw conclusions; be concrete and
-  skimmable. Use plain bullets ("- ") and "1." numbering, short lines. Keep it
-  tight — no fluff, no "this page shows…".
+- Draw conclusions; be concrete and skimmable. Use plain bullets ("- ") and
+  "1." numbering, short lines. Keep it tight — no fluff, no "this page shows…".
 
 Topics: canonical/standardized; specific over generic; do NOT put the category
-word itself into topics."""
+word itself into topics.{_lang_instruction(lang) or ' Write title and summary in the content language.'}"""
 
     resp = client.messages.create(
         model=settings.claude_model_fast,
@@ -242,7 +254,7 @@ word itself into topics."""
     )
 
 
-def extractAttributesFromNote(text: str) -> ExtractedAttributes:
+def extractAttributesFromNote(text: str, lang: str = "") -> ExtractedAttributes:
     """
     Attributes for the user's OWN note/idea (typed or dictated). Unlike a web
     page, we stay faithful — extract a title + light summary + topics, never
@@ -281,14 +293,15 @@ SUMMARY RULES — match the shape to the content, but stay faithful (never inven
   implied by the note; otherwise just the item.
 - If it's a to-do list → "- " checklist of the tasks.
 - If it's steps/a plan → numbered "1." list.
-- Otherwise → a faithful 1-2 sentence gist in the note's language.
-- Use **bold** sparingly for the key thing. Keep the user's own wording.
+- Otherwise → a faithful 1-2 sentence gist.
+- Use **bold** sparingly for the key thing. Don't invent facts (the verbatim
+  note is preserved separately, so the summary may be phrased in another language).
 
 kind: "list" when the note is mainly an enumeration; "quote" only for a
 quotation/aphorism; "task" for a to-do; "question" for an open question; "fact"
 for a factual snippet; else "idea" or "note".
 Topics: canonical/standardized; specific over generic; do NOT put the category
-word itself into topics."""
+word itself into topics.{_lang_instruction(lang)}"""
 
     resp = client.messages.create(
         model=settings.claude_model_fast,

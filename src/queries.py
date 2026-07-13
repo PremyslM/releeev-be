@@ -127,6 +127,11 @@ MATCH (c:Capture {id: $id})
 SET c.context = $context
 """
 
+DELETE_CAPTURE = """
+MATCH (c:Capture {id: $id}) WHERE c.user_id = $uid
+DETACH DELETE c
+"""
+
 # Assign all still-unowned captures to a user (one-off migration).
 CLAIM_ORPHAN_CAPTURES = """
 MATCH (c:Capture) WHERE c.user_id IS NULL
