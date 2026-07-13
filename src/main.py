@@ -352,7 +352,7 @@ async def analyze_capture(
     # ── Extract ───────────────────────────────────────────────────────────────
     try:
         attributes: ExtractedAttributes = extractAttributes(
-            req.image_base64, req.image_mime
+            req.image_base64, req.image_mime, lang=req.lang
         )
     except anthropic.AuthenticationError as exc:
         raise HTTPException(status_code=401, detail="Invalid Anthropic API key") from exc
@@ -595,7 +595,7 @@ async def analyze_url(
 
     # ── Extract attributes via Claude (text), then run the standard pipeline ──
     try:
-        attributes = extractAttributesFromText(text, url, signals)
+        attributes = extractAttributesFromText(text, url, signals, lang=req.lang)
     except anthropic.APIError as exc:
         raise HTTPException(status_code=502, detail=f"Claude API error: {exc}") from exc
 
@@ -720,7 +720,7 @@ async def analyze_note(
             )
 
     try:
-        attributes = extractAttributesFromNote(note)
+        attributes = extractAttributesFromNote(note, lang=req.lang)
     except anthropic.APIError as exc:
         raise HTTPException(status_code=502, detail=f"Claude API error: {exc}") from exc
 
@@ -868,6 +868,17 @@ async def get_capture(
     return CaptureDetailResponse(capture=capture, connections=connections,
                                  subject=subject, location=location,
                                  context=node.get("context", "") or "")
+
+
+@app.delete("/captures/{capture_id}", summary="Delete a capture")
+async def delete_capture(capture_id: str, user_id: str = Depends(get_current_user)):
+    """Remove a capture and all its relationships (scoped to the owner)."""
+    async with get_session() as session:
+        result = await session.run(Q.DELETE_CAPTURE, id=capture_id, uid=user_id)
+        deleted = (await result.consume()).counters.nodes_deleted
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="Záznam nenalezen.")
+    return {"deleted": capture_id}
 
 
 # ── Entity navigation (browsable hubs) ───────────────────────────────────────
