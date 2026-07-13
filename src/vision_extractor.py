@@ -74,9 +74,12 @@ def _lang_instruction(lang: str) -> str:
     lang = (lang or "").strip()
     if not lang:
         return ""
-    return (f' IMPORTANT: write "title" and "summary" in the user\'s language '
-            f'(ISO code "{lang}"), even if the source content is in another '
-            f'language. Keep "topics" in canonical English.')
+    return (f' IMPORTANT: write "title" and "summary" ENTIRELY in the user\'s '
+            f'language (ISO code "{lang}"), even if the source content is in '
+            f'another language. This includes every section label inside the '
+            f'summary — translate headings like "Ingredients:"/"Steps:"/"Note:" '
+            f'into that language too (do not leave them in English). Keep '
+            f'"topics" in canonical English.')
 
 
 # ── Main functions ────────────────────────────────────────────────────────────
@@ -209,7 +212,10 @@ Return JSON:
 
 SUMMARY RULES — extract what's worth keeping, don't just describe the page:
 - Adapt the shape to the content:
-  • Recipe → an "Ingredients:" bulleted list, then numbered "Steps:".
+  • Recipe → an "Ingredients:" bulleted list where EACH bullet includes the
+    amount/quantity from the page (e.g. "- 500 g potatoes", "- 2 eggs"). If the
+    page truly gives no amount for an item, list it without one — never invent
+    quantities. Then a numbered "Steps:" list.
   • How-to / tutorial → the key steps or takeaways as a short list.
   • Product → what it is + key specs / price as a few bullets.
   • Article / video → 3-6 bullet key points or conclusions.
