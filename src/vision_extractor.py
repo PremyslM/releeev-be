@@ -263,8 +263,8 @@ Note:
 Return JSON:
 {{
   "title":    "<3-6 word title capturing the note>",
-  "summary":  "<1-2 sentence faithful gist in the note's language, or the note itself if already short>",
-  "kind":     "<one of: quote|idea|task|fact|question|note>",
+  "summary":  "<see SUMMARY RULES>",
+  "kind":     "<one of: quote|idea|task|fact|question|list|note>",
   "author":   "<if kind=quote and an author is stated/known, their name; else empty>",
   "topics":   ["<4-8 specific topic keywords>"],
   "category": "<exactly ONE of: {allowed}>",
@@ -274,9 +274,19 @@ Return JSON:
   "sentiment":"<positive|negative|neutral>"
 }}
 
-kind: pick "quote" only if the note is a quotation/aphorism (often in quotes or
-attributed to someone); "task" if it's a to-do; "question" if it's an open
-question; "fact" for a factual snippet; else "idea" or "note".
+SUMMARY RULES — match the shape to the content, but stay faithful (never invent):
+- If the note enumerates things (films, books, places, shopping, songs, ideas)
+  → format the summary as a clean Markdown list ("- item"), one per line, tidied
+  (dedupe, fix casing). You MAY add a 2-4 word tag per item ONLY if it's clearly
+  implied by the note; otherwise just the item.
+- If it's a to-do list → "- " checklist of the tasks.
+- If it's steps/a plan → numbered "1." list.
+- Otherwise → a faithful 1-2 sentence gist in the note's language.
+- Use **bold** sparingly for the key thing. Keep the user's own wording.
+
+kind: "list" when the note is mainly an enumeration; "quote" only for a
+quotation/aphorism; "task" for a to-do; "question" for an open question; "fact"
+for a factual snippet; else "idea" or "note".
 Topics: canonical/standardized; specific over generic; do NOT put the category
 word itself into topics."""
 
@@ -302,7 +312,7 @@ word itself into topics."""
         topics.append(category)
 
     kind = (data.get("kind") or "note").strip().lower()
-    if kind not in {"quote", "idea", "task", "fact", "question", "note"}:
+    if kind not in {"quote", "idea", "task", "fact", "question", "list", "note"}:
         kind = "note"
 
     return ExtractedAttributes(
