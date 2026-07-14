@@ -527,6 +527,22 @@ RETURN c.id           AS id,
        collect(toLower(t.name)) AS topics
 """
 
+# Most-recently-added captures — the "Recent logs" browse list in search.
+RECENT_CAPTURES = """
+MATCH (c:Capture)
+WHERE c.user_id = $uid
+OPTIONAL MATCH (c)-[:HAS_TOPIC]->(t:Topic)
+WITH c, collect(toLower(t.name)) AS topics
+RETURN c.id           AS id,
+       c.title        AS title,
+       c.summary      AS summary,
+       c.capture_type AS capture_type,
+       c.created_at   AS created_at,
+       topics
+ORDER BY c.created_at DESC
+LIMIT $limit
+"""
+
 # ── Faceted search: fetch filterable fields for a set of candidate captures ──
 GET_CAPTURE_FACETS = """
 MATCH (c:Capture)

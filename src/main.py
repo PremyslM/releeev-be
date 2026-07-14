@@ -854,6 +854,33 @@ async def analyze_note(
     )
 
 
+@app.get("/captures/recent", response_model=SearchResponse,
+         summary="Most-recently-added captures (browse list)")
+async def recent_captures(
+    limit: int = 12,
+    user_id: str = Depends(get_current_user),
+) -> SearchResponse:
+    """The 'Recent logs' list shown in search before the user types anything.
+    Declared before /captures/{capture_id} so 'recent' isn't taken as an id."""
+    limit = max(1, min(limit, 50))
+    async with get_session() as session:
+        rec = await session.run(Q.RECENT_CAPTURES, uid=user_id, limit=limit)
+        rows = [r async for r in rec]
+    results = [
+        SearchResult(
+            capture_id=r["id"],
+            title=r["title"] or "",
+            summary=r["summary"] or "",
+            score=1.0,
+            created_at=_to_native(r["created_at"]),
+            category=next((t for t in (r["topics"] or []) if t in DOMAIN_TOPICS), ""),
+            capture_type=r["capture_type"] or "",
+        )
+        for r in rows
+    ]
+    return SearchResponse(query="", results=results, total=len(results), facets={})
+
+
 @app.get(
     "/captures/{capture_id}",
     response_model=CaptureDetailResponse,
