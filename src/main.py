@@ -39,6 +39,8 @@ from src.models import (
     BugReportResponse,
     LoginRequest,
     RegisterRequest,
+    ReanalyzeRequest,
+    UpdateCaptureRequest,
     LocationInfo,
     CaptureDetailResponse,
     CaptureLink,
@@ -437,8 +439,80 @@ async def analyze_capture(
 
 # ── Analyze a URL (link upload) ───────────────────────────────────────────────
 
+# Site "chrome" that pollutes a scrape: navigation, menus, headers, footers,
+# sidebars, forms, scripts. Dropped whole (with contents) before flattening so
+# the model — and the stored text — see the article, not the menu.
+_CHROME_TAGS = (
+    "script", "style", "noscript", "nav", "header", "footer", "aside",
+    "form", "svg", "button", "select", "template", "dialog", "iframe",
+)
+
+
+def _jsonld_content(html: str) -> str:
+    """Clean recipe/article text from schema.org JSON-LD, when the page ships it.
+
+    Recipe JSON-LD carries `recipeIngredient` (already "500 g potatoes") and
+    `recipeInstructions` — far cleaner than scraping the rendered page, and it
+    gives us ingredient amounts for free. Returns "" when there's no usable
+    structured data."""
+    import json as _json
+
+    def walk(obj):
+        """Yield every dict in a nested JSON-LD structure (@graph, arrays)."""
+        if isinstance(obj, dict):
+            yield obj
+            for v in obj.values():
+                yield from walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                yield from walk(v)
+
+    def types(node) -> set[str]:
+        t = node.get("@type", "")
+        return {t.lower()} if isinstance(t, str) else {str(x).lower() for x in t}
+
+    def as_text(step) -> str:
+        if isinstance(step, str):
+            return step.strip()
+        if isinstance(step, dict):
+            return (step.get("text") or step.get("name") or "").strip()
+        return ""
+
+    for block in _re.findall(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html, _re.I | _re.S,
+    ):
+        try:
+            data = _json.loads(block.strip())
+        except (_json.JSONDecodeError, ValueError):
+            continue
+        for node in walk(data):
+            if not isinstance(node, dict):
+                continue
+            if "recipe" in types(node):
+                parts = []
+                if node.get("name"):
+                    parts.append(str(node["name"]).strip())
+                if node.get("description"):
+                    parts.append(str(node["description"]).strip())
+                ings = [str(i).strip() for i in node.get("recipeIngredient", []) if str(i).strip()]
+                if ings:
+                    parts.append("Ingredients:\n" + "\n".join(f"- {i}" for i in ings))
+                steps = [as_text(s) for s in node.get("recipeInstructions", [])]
+                steps = [s for s in steps if s]
+                if steps:
+                    parts.append("Steps:\n" + "\n".join(f"{n}. {s}" for n, s in enumerate(steps, 1)))
+                if ings or steps:
+                    return "\n\n".join(parts).strip()
+    return ""
+
+
 def _parse_html(html: str) -> tuple[dict, str]:
-    """Extract title/OG/meta signals and a cleaned text dump from raw HTML."""
+    """Extract title/OG/meta signals and a cleaned text dump from raw HTML.
+
+    Prefers structured data (JSON-LD recipe/article) and the main content
+    region, and strips site chrome (nav/menu/header/footer) so the result is the
+    article — not the surrounding navigation."""
     def meta(prop: str, attr: str = "property") -> str:
         m = _re.search(
             rf'<meta[^>]+{attr}=["\']{_re.escape(prop)}["\'][^>]+content=["\']([^"\']+)',
@@ -458,10 +532,28 @@ def _parse_html(html: str) -> tuple[dict, str]:
         "description": meta("description", attr="name"),
     }
 
-    text = _re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", html, flags=_re.I | _re.S)
-    text = _re.sub(r"<[^>]+>", " ", text)
+    # 1) Best case: clean structured data (recipe ingredients+steps, etc.).
+    structured = _jsonld_content(html)
+
+    # 2) Otherwise flatten the page, but first drop chrome and prefer the main
+    #    content region so menus/sidebars don't drown the article.
+    body = html
+    for tag in _CHROME_TAGS:
+        body = _re.sub(rf"<{tag}\b[^>]*>.*?</{tag}>", " ", body, flags=_re.I | _re.S)
+    main_m = (
+        _re.search(r"<main\b[^>]*>(.*?)</main>", body, _re.I | _re.S)
+        or _re.search(r"<article\b[^>]*>(.*?)</article>", body, _re.I | _re.S)
+    )
+    if main_m and len(main_m.group(1)) > 400:
+        body = main_m.group(1)
+
+    text = _re.sub(r"<[^>]+>", " ", body)
     text = _re.sub(r"&(nbsp|amp|quot|#39|lt|gt);", " ", text)
     text = _re.sub(r"\s+", " ", text).strip()
+
+    # Lead with the structured content when we have it — it's the cleanest signal.
+    if structured:
+        text = (structured + "\n\n" + text)[:8000]
     return signals, text
 
 
@@ -762,6 +854,33 @@ async def analyze_note(
     )
 
 
+@app.get("/captures/recent", response_model=SearchResponse,
+         summary="Most-recently-added captures (browse list)")
+async def recent_captures(
+    limit: int = 12,
+    user_id: str = Depends(get_current_user),
+) -> SearchResponse:
+    """The 'Recent logs' list shown in search before the user types anything.
+    Declared before /captures/{capture_id} so 'recent' isn't taken as an id."""
+    limit = max(1, min(limit, 50))
+    async with get_session() as session:
+        rec = await session.run(Q.RECENT_CAPTURES, uid=user_id, limit=limit)
+        rows = [r async for r in rec]
+    results = [
+        SearchResult(
+            capture_id=r["id"],
+            title=r["title"] or "",
+            summary=r["summary"] or "",
+            score=1.0,
+            created_at=_to_native(r["created_at"]),
+            category=next((t for t in (r["topics"] or []) if t in DOMAIN_TOPICS), ""),
+            capture_type=r["capture_type"] or "",
+        )
+        for r in rows
+    ]
+    return SearchResponse(query="", results=results, total=len(results), facets={})
+
+
 @app.get(
     "/captures/{capture_id}",
     response_model=CaptureDetailResponse,
@@ -879,6 +998,100 @@ async def delete_capture(capture_id: str, user_id: str = Depends(get_current_use
     if deleted == 0:
         raise HTTPException(status_code=404, detail="Záznam nenalezen.")
     return {"deleted": capture_id}
+
+
+@app.patch("/captures/{capture_id}", response_model=CaptureDetailResponse,
+           summary="Edit a capture's title / summary")
+async def update_capture(
+    capture_id: str,
+    req: UpdateCaptureRequest,
+    user_id: str = Depends(get_current_user),
+) -> CaptureDetailResponse:
+    """Manual edit of the user-facing text. The embedding is refreshed so search
+    and linking reflect the change."""
+    async with get_session() as session:
+        rec = await (await session.run(Q.GET_CAPTURE_BY_ID, id=capture_id, uid=user_id)).single()
+        if rec is None:
+            raise HTTPException(status_code=404, detail="Záznam nenalezen.")
+        node = rec["c"]
+        topics = [t for t in (rec.get("topics") or []) if t]
+
+    title = req.title.strip() or node.get("title", "")
+    summary = req.summary.strip()
+    embedding = getEmbedding(f"{title} {summary} {' '.join(topics)}")
+    async with get_session() as session:
+        await session.run(Q.UPDATE_CAPTURE_TEXT, id=capture_id, uid=user_id,
+                          title=title, summary=summary, embedding=embedding)
+    return await get_capture(capture_id, user_id)
+
+
+@app.post("/captures/{capture_id}/reanalyze", response_model=CaptureDetailResponse,
+          summary="Re-extract a capture from its source (URL or note text)")
+async def reanalyze_capture(
+    capture_id: str,
+    req: ReanalyzeRequest,
+    user_id: str = Depends(get_current_user),
+) -> CaptureDetailResponse:
+    """Re-run extraction against whatever source the capture still has — the
+    web page (re-fetched) or the note text. Handy when an early extraction was
+    poor, or to refresh old captures with an improved extractor. Photos can't be
+    re-analyzed here (their image lives only on the device)."""
+    async with get_session() as session:
+        rec = await (await session.run(Q.GET_CAPTURE_BY_ID, id=capture_id, uid=user_id)).single()
+        if rec is None:
+            raise HTTPException(status_code=404, detail="Záznam nenalezen.")
+        node = rec["c"]
+
+    url = node.get("url") or ""
+    raw_text = node.get("raw_text") or ""
+
+    if url:
+        signals: dict = {}
+        text = ""
+        try:
+            signals, text = await _fetch_page(url)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Reanalyze fetch failed (%s) — using URL slug", exc)
+        if not text and not any(signals.values()):
+            slug = _url_slug_text(url)
+            if not slug:
+                raise HTTPException(status_code=400, detail="Stránku se nepodařilo načíst.")
+            signals, text = {"url path": slug, "site": ""}, slug
+        try:
+            attrs = extractAttributesFromText(text, url, signals, lang=req.lang)
+        except anthropic.APIError as exc:
+            raise HTTPException(status_code=502, detail=f"Claude API error: {exc}") from exc
+    elif raw_text:
+        try:
+            attrs = extractAttributesFromNote(raw_text, lang=req.lang)
+        except anthropic.APIError as exc:
+            raise HTTPException(status_code=502, detail=f"Claude API error: {exc}") from exc
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="Tento záznam nelze znovu analyzovat (fotku ani zdroj nemáme).",
+        )
+
+    embedding = getEmbedding(f"{attrs.title} {attrs.summary} {' '.join(attrs.topics)}")
+    async with get_session() as session:
+        await session.run(
+            Q.UPDATE_CAPTURE_EXTRACTION, id=capture_id, uid=user_id,
+            title=attrs.title, summary=attrs.summary, raw_text=attrs.raw_text,
+            language=attrs.language, kind=attrs.kind, author=attrs.author,
+            embedding=embedding,
+        )
+        # Re-wire topics / people / places to match the fresh extraction.
+        await session.run(
+            "MATCH (c:Capture {id: $id})-[r:HAS_TOPIC|MENTIONS]->() DELETE r", id=capture_id,
+        )
+        for t in attrs.topics:
+            await session.run(Q.UPSERT_TOPIC, name=t, capture_id=capture_id)
+        for p in attrs.people:
+            await session.run(Q.UPSERT_PERSON, name=p, capture_id=capture_id)
+        for pl in attrs.places:
+            await session.run(Q.UPSERT_PLACE, name=pl, capture_id=capture_id)
+
+    return await get_capture(capture_id, user_id)
 
 
 # ── Entity navigation (browsable hubs) ───────────────────────────────────────

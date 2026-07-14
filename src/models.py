@@ -118,6 +118,17 @@ class AnalyzeNoteRequest(BaseModel):
     lang: str = ""                  # device language ISO code
 
 
+class UpdateCaptureRequest(BaseModel):
+    """Manual edit of a capture's user-facing text."""
+    title: str = ""
+    summary: str = ""
+
+
+class ReanalyzeRequest(BaseModel):
+    """Ask the model to re-extract a capture from its source (URL or note text)."""
+    lang: str = ""                  # device language ISO code — write records in it
+
+
 class LinkedCapture(BaseModel):
     capture_id: str
     link_type: LinkType

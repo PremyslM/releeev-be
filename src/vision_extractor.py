@@ -68,15 +68,30 @@ Respond with ONLY valid JSON — no markdown fences, no prose.
 """
 
 
+# ISO-639-1 → language name, so the model gets a named target (which it follows
+# far better than a bare code) rather than just "cs".
+_LANG_NAMES = {
+    "cs": "Czech (čeština)", "sk": "Slovak (slovenčina)", "en": "English",
+    "de": "German (Deutsch)", "pl": "Polish (polski)", "es": "Spanish (español)",
+    "fr": "French (français)", "it": "Italian (italiano)", "pt": "Portuguese (português)",
+    "ru": "Russian (русский)", "uk": "Ukrainian (українська)", "nl": "Dutch (Nederlands)",
+}
+
+
 def _lang_instruction(lang: str) -> str:
     """Ask the model to write the human-facing fields in the device language,
     while topics stay canonical English (so related captures share keywords)."""
     lang = (lang or "").strip()
     if not lang:
         return ""
-    return (f' IMPORTANT: write "title" and "summary" in the user\'s language '
-            f'(ISO code "{lang}"), even if the source content is in another '
-            f'language. Keep "topics" in canonical English.')
+    name = _LANG_NAMES.get(lang.lower(), f'the language with ISO code "{lang}"')
+    return (f' CRITICAL LANGUAGE RULE: write "title" and "summary" ENTIRELY in '
+            f'{name}. TRANSLATE everything into {name} — the summary must contain '
+            f'NO words from the source language or any other language. Never copy '
+            f'or transliterate source words (e.g. a product description); render '
+            f'them in {name}. Every sentence, section label (translate '
+            f'"Ingredients:"/"Steps:"/"Note:" too) and list item must be in '
+            f'{name}. Keep only "topics" in canonical English.')
 
 
 # ── Main functions ────────────────────────────────────────────────────────────
@@ -209,7 +224,10 @@ Return JSON:
 
 SUMMARY RULES — extract what's worth keeping, don't just describe the page:
 - Adapt the shape to the content:
-  • Recipe → an "Ingredients:" bulleted list, then numbered "Steps:".
+  • Recipe → an "Ingredients:" bulleted list where EACH bullet includes the
+    amount/quantity from the page (e.g. "- 500 g potatoes", "- 2 eggs"). If the
+    page truly gives no amount for an item, list it without one — never invent
+    quantities. Then a numbered "Steps:" list.
   • How-to / tutorial → the key steps or takeaways as a short list.
   • Product → what it is + key specs / price as a few bullets.
   • Article / video → 3-6 bullet key points or conclusions.
@@ -241,9 +259,12 @@ word itself into topics.{_lang_instruction(lang) or ' Write title and summary in
         topics.append(category)
 
     return ExtractedAttributes(
+        # A web page's own value lives in the synthesized summary + the reopenable
+        # link — not the raw scrape, which is site chrome + boilerplate. Storing it
+        # as raw_text just surfaces a confusing "Notes" dump, so we leave it empty.
         title=data.get("title", "") or (signals.get("og:title") or signals.get("page title") or url),
         summary=data.get("summary", ""),
-        raw_text=text[:2000],
+        raw_text="",
         capture_type=CaptureType.document,
         topics=topics,
         people=[p for p in data.get("people", []) if isinstance(p, str)][:10],

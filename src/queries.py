@@ -132,6 +132,26 @@ MATCH (c:Capture {id: $id}) WHERE c.user_id = $uid
 DETACH DELETE c
 """
 
+# Manual edit of the user-facing text (title / summary), with a refreshed embedding.
+UPDATE_CAPTURE_TEXT = """
+MATCH (c:Capture {id: $id}) WHERE c.user_id = $uid
+SET c.title = $title, c.summary = $summary, c.embedding = $embedding
+RETURN c
+"""
+
+# Full re-extraction: refresh every model-produced field + embedding in place.
+UPDATE_CAPTURE_EXTRACTION = """
+MATCH (c:Capture {id: $id}) WHERE c.user_id = $uid
+SET c.title     = $title,
+    c.summary   = $summary,
+    c.raw_text  = $raw_text,
+    c.language  = $language,
+    c.kind      = $kind,
+    c.author    = $author,
+    c.embedding = $embedding
+RETURN c
+"""
+
 # Assign all still-unowned captures to a user (one-off migration).
 CLAIM_ORPHAN_CAPTURES = """
 MATCH (c:Capture) WHERE c.user_id IS NULL
@@ -505,6 +525,22 @@ RETURN c.id           AS id,
        c.capture_type AS capture_type,
        c.created_at   AS created_at,
        collect(toLower(t.name)) AS topics
+"""
+
+# Most-recently-added captures — the "Recent logs" browse list in search.
+RECENT_CAPTURES = """
+MATCH (c:Capture)
+WHERE c.user_id = $uid
+OPTIONAL MATCH (c)-[:HAS_TOPIC]->(t:Topic)
+WITH c, collect(toLower(t.name)) AS topics
+RETURN c.id           AS id,
+       c.title        AS title,
+       c.summary      AS summary,
+       c.capture_type AS capture_type,
+       c.created_at   AS created_at,
+       topics
+ORDER BY c.created_at DESC
+LIMIT $limit
 """
 
 # ── Faceted search: fetch filterable fields for a set of candidate captures ──
