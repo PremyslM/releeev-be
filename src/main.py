@@ -39,6 +39,8 @@ from src.models import (
     BugReportResponse,
     LoginRequest,
     RegisterRequest,
+    ReanalyzeRequest,
+    UpdateCaptureRequest,
     LocationInfo,
     CaptureDetailResponse,
     CaptureLink,
@@ -969,6 +971,100 @@ async def delete_capture(capture_id: str, user_id: str = Depends(get_current_use
     if deleted == 0:
         raise HTTPException(status_code=404, detail="Záznam nenalezen.")
     return {"deleted": capture_id}
+
+
+@app.patch("/captures/{capture_id}", response_model=CaptureDetailResponse,
+           summary="Edit a capture's title / summary")
+async def update_capture(
+    capture_id: str,
+    req: UpdateCaptureRequest,
+    user_id: str = Depends(get_current_user),
+) -> CaptureDetailResponse:
+    """Manual edit of the user-facing text. The embedding is refreshed so search
+    and linking reflect the change."""
+    async with get_session() as session:
+        rec = await (await session.run(Q.GET_CAPTURE_BY_ID, id=capture_id, uid=user_id)).single()
+        if rec is None:
+            raise HTTPException(status_code=404, detail="Záznam nenalezen.")
+        node = rec["c"]
+        topics = [t for t in (rec.get("topics") or []) if t]
+
+    title = req.title.strip() or node.get("title", "")
+    summary = req.summary.strip()
+    embedding = getEmbedding(f"{title} {summary} {' '.join(topics)}")
+    async with get_session() as session:
+        await session.run(Q.UPDATE_CAPTURE_TEXT, id=capture_id, uid=user_id,
+                          title=title, summary=summary, embedding=embedding)
+    return await get_capture(capture_id, user_id)
+
+
+@app.post("/captures/{capture_id}/reanalyze", response_model=CaptureDetailResponse,
+          summary="Re-extract a capture from its source (URL or note text)")
+async def reanalyze_capture(
+    capture_id: str,
+    req: ReanalyzeRequest,
+    user_id: str = Depends(get_current_user),
+) -> CaptureDetailResponse:
+    """Re-run extraction against whatever source the capture still has — the
+    web page (re-fetched) or the note text. Handy when an early extraction was
+    poor, or to refresh old captures with an improved extractor. Photos can't be
+    re-analyzed here (their image lives only on the device)."""
+    async with get_session() as session:
+        rec = await (await session.run(Q.GET_CAPTURE_BY_ID, id=capture_id, uid=user_id)).single()
+        if rec is None:
+            raise HTTPException(status_code=404, detail="Záznam nenalezen.")
+        node = rec["c"]
+
+    url = node.get("url") or ""
+    raw_text = node.get("raw_text") or ""
+
+    if url:
+        signals: dict = {}
+        text = ""
+        try:
+            signals, text = await _fetch_page(url)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Reanalyze fetch failed (%s) — using URL slug", exc)
+        if not text and not any(signals.values()):
+            slug = _url_slug_text(url)
+            if not slug:
+                raise HTTPException(status_code=400, detail="Stránku se nepodařilo načíst.")
+            signals, text = {"url path": slug, "site": ""}, slug
+        try:
+            attrs = extractAttributesFromText(text, url, signals, lang=req.lang)
+        except anthropic.APIError as exc:
+            raise HTTPException(status_code=502, detail=f"Claude API error: {exc}") from exc
+    elif raw_text:
+        try:
+            attrs = extractAttributesFromNote(raw_text, lang=req.lang)
+        except anthropic.APIError as exc:
+            raise HTTPException(status_code=502, detail=f"Claude API error: {exc}") from exc
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="Tento záznam nelze znovu analyzovat (fotku ani zdroj nemáme).",
+        )
+
+    embedding = getEmbedding(f"{attrs.title} {attrs.summary} {' '.join(attrs.topics)}")
+    async with get_session() as session:
+        await session.run(
+            Q.UPDATE_CAPTURE_EXTRACTION, id=capture_id, uid=user_id,
+            title=attrs.title, summary=attrs.summary, raw_text=attrs.raw_text,
+            language=attrs.language, kind=attrs.kind, author=attrs.author,
+            embedding=embedding,
+        )
+        # Re-wire topics / people / places to match the fresh extraction.
+        await session.run(
+            "MATCH (c:Capture {id: $id})-[r:HAS_TOPIC|MENTIONS]->() DELETE r", id=capture_id,
+        )
+        for t in attrs.topics:
+            await session.run(Q.UPSERT_TOPIC, name=t, capture_id=capture_id)
+        for p in attrs.people:
+            await session.run(Q.UPSERT_PERSON, name=p, capture_id=capture_id)
+        for pl in attrs.places:
+            await session.run(Q.UPSERT_PLACE, name=pl, capture_id=capture_id)
+
+    return await get_capture(capture_id, user_id)
 
 
 # ── Entity navigation (browsable hubs) ───────────────────────────────────────

@@ -132,6 +132,26 @@ MATCH (c:Capture {id: $id}) WHERE c.user_id = $uid
 DETACH DELETE c
 """
 
+# Manual edit of the user-facing text (title / summary), with a refreshed embedding.
+UPDATE_CAPTURE_TEXT = """
+MATCH (c:Capture {id: $id}) WHERE c.user_id = $uid
+SET c.title = $title, c.summary = $summary, c.embedding = $embedding
+RETURN c
+"""
+
+# Full re-extraction: refresh every model-produced field + embedding in place.
+UPDATE_CAPTURE_EXTRACTION = """
+MATCH (c:Capture {id: $id}) WHERE c.user_id = $uid
+SET c.title     = $title,
+    c.summary   = $summary,
+    c.raw_text  = $raw_text,
+    c.language  = $language,
+    c.kind      = $kind,
+    c.author    = $author,
+    c.embedding = $embedding
+RETURN c
+"""
+
 # Assign all still-unowned captures to a user (one-off migration).
 CLAIM_ORPHAN_CAPTURES = """
 MATCH (c:Capture) WHERE c.user_id IS NULL
