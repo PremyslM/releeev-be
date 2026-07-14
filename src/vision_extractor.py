@@ -68,18 +68,30 @@ Respond with ONLY valid JSON — no markdown fences, no prose.
 """
 
 
+# ISO-639-1 → language name, so the model gets a named target (which it follows
+# far better than a bare code) rather than just "cs".
+_LANG_NAMES = {
+    "cs": "Czech (čeština)", "sk": "Slovak (slovenčina)", "en": "English",
+    "de": "German (Deutsch)", "pl": "Polish (polski)", "es": "Spanish (español)",
+    "fr": "French (français)", "it": "Italian (italiano)", "pt": "Portuguese (português)",
+    "ru": "Russian (русский)", "uk": "Ukrainian (українська)", "nl": "Dutch (Nederlands)",
+}
+
+
 def _lang_instruction(lang: str) -> str:
     """Ask the model to write the human-facing fields in the device language,
     while topics stay canonical English (so related captures share keywords)."""
     lang = (lang or "").strip()
     if not lang:
         return ""
-    return (f' IMPORTANT: write "title" and "summary" ENTIRELY in the user\'s '
-            f'language (ISO code "{lang}"), even if the source content is in '
-            f'another language. This includes every section label inside the '
-            f'summary — translate headings like "Ingredients:"/"Steps:"/"Note:" '
-            f'into that language too (do not leave them in English). Keep '
-            f'"topics" in canonical English.')
+    name = _LANG_NAMES.get(lang.lower(), f'the language with ISO code "{lang}"')
+    return (f' CRITICAL LANGUAGE RULE: write "title" and "summary" ENTIRELY in '
+            f'{name}. TRANSLATE everything into {name} — the summary must contain '
+            f'NO words from the source language or any other language. Never copy '
+            f'or transliterate source words (e.g. a product description); render '
+            f'them in {name}. Every sentence, section label (translate '
+            f'"Ingredients:"/"Steps:"/"Note:" too) and list item must be in '
+            f'{name}. Keep only "topics" in canonical English.')
 
 
 # ── Main functions ────────────────────────────────────────────────────────────
