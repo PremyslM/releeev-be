@@ -78,6 +78,22 @@ _LANG_NAMES = {
 }
 
 
+# One log should join a couple of WIDE shelves, not spawn a private taxonomy.
+# Topics are the user-visible "categories"/strings, so many narrow ones fragment
+# the brain into single-member buckets; the title and summary already carry the
+# specifics.
+_TOPIC_RULES = (
+    'Topics: name the BROADEST shelf this log belongs on — the general kind of '
+    'thing it is, not its details. Give 1-3 topics, and only more than one if it '
+    'genuinely spans separate areas. Prefer wide, reusable English nouns that '
+    'many future logs could share ("coffee" — not "v60 pour-over technique"; '
+    '"cars" — not "nissan pathfinder offroad suspension"; "ai" — not "cursor vs '
+    'copilot autocomplete"). Never add a topic just to be thorough: a narrower '
+    'topic is only worth it if you would expect a dozen other logs under it. Do '
+    'NOT put the category word itself into topics.'
+)
+
+
 def _lang_instruction(lang: str) -> str:
     """Ask the model to write the human-facing fields in the device language,
     while topics stay canonical English (so related captures share keywords)."""
@@ -133,7 +149,8 @@ def extractAttributes(
                             "Analyse this image and return the JSON object. "
                             f'The "category" must be exactly ONE of: {allowed}. '
                             "Pick the closest one even for photos (e.g. a car photo → "
-                            "automotive). Do NOT put the category word itself into topics."
+                            "automotive). "
+                            + _TOPIC_RULES
                             + _lang_instruction(lang)
                         ),
                     },
@@ -167,7 +184,8 @@ def extractAttributes(
     # Ensure the broad domain category is one of the topics, so photos link to
     # documents of the same domain (e.g. a car photo ↔ a car listing via
     # "automotive"). Mirrors the URL/text extraction path.
-    topics = [t for t in data.get("topics", []) if isinstance(t, str)][:15]
+    # Hard guard: keep the shelf list short even if the model over-produces.
+    topics = [t for t in data.get("topics", []) if isinstance(t, str)][:3]
     category = (data.get("category") or "").strip().lower()
     if category in DOMAIN_TOPICS and category not in [t.lower() for t in topics]:
         topics.append(category)
@@ -214,7 +232,7 @@ Return JSON:
 {{
   "title":    "<concise, specific title of what this is>",
   "summary":  "<a genuinely useful synthesis — see rules>",
-  "topics":   ["<6-10 specific English topic keywords>"],
+  "topics":   ["<1-3 broad English topic keywords — see Topics rule>"],
   "category": "<exactly ONE of: {allowed}>",
   "people":   ["<real person names, or []>"],
   "places":   ["<real place names / brands, or []>"],
@@ -234,8 +252,7 @@ SUMMARY RULES — extract what's worth keeping, don't just describe the page:
 - Draw conclusions; be concrete and skimmable. Use plain bullets ("- ") and
   "1." numbering, short lines. Keep it tight — no fluff, no "this page shows…".
 
-Topics: canonical/standardized; specific over generic; do NOT put the category
-word itself into topics.{_lang_instruction(lang) or ' Write title and summary in the content language.'}"""
+{_TOPIC_RULES}{_lang_instruction(lang) or ' Write title and summary in the content language.'}"""
 
     resp = client.messages.create(
         model=settings.claude_model_fast,
@@ -253,7 +270,8 @@ word itself into topics.{_lang_instruction(lang) or ' Write title and summary in
         logger.error("URL attribute JSON parse failed: %s\nRaw: %s", exc, raw[:300])
         data = {}
 
-    topics = [t for t in data.get("topics", []) if isinstance(t, str)][:15]
+    # Hard guard: keep the shelf list short even if the model over-produces.
+    topics = [t for t in data.get("topics", []) if isinstance(t, str)][:3]
     category = (data.get("category") or "").strip().lower()
     if category in DOMAIN_TOPICS and category not in [t.lower() for t in topics]:
         topics.append(category)
@@ -299,7 +317,7 @@ Return JSON:
   "summary":  "<see SUMMARY RULES>",
   "kind":     "<one of: quote|idea|task|fact|question|list|note>",
   "author":   "<if kind=quote and an author is stated/known, their name; else empty>",
-  "topics":   ["<4-8 specific topic keywords>"],
+  "topics":   ["<1-3 broad topic keywords — see Topics rule>"],
   "category": "<exactly ONE of: {allowed}>",
   "people":   ["<names mentioned, or []>"],
   "places":   ["<places mentioned, or []>"],
@@ -321,8 +339,7 @@ SUMMARY RULES — match the shape to the content, but stay faithful (never inven
 kind: "list" when the note is mainly an enumeration; "quote" only for a
 quotation/aphorism; "task" for a to-do; "question" for an open question; "fact"
 for a factual snippet; else "idea" or "note".
-Topics: canonical/standardized; specific over generic; do NOT put the category
-word itself into topics.{_lang_instruction(lang)}"""
+{_TOPIC_RULES}{_lang_instruction(lang)}"""
 
     resp = client.messages.create(
         model=settings.claude_model_fast,
@@ -340,7 +357,8 @@ word itself into topics.{_lang_instruction(lang)}"""
         logger.error("Note attribute JSON parse failed: %s\nRaw: %s", exc, raw[:300])
         data = {}
 
-    topics = [t for t in data.get("topics", []) if isinstance(t, str)][:15]
+    # Hard guard: keep the shelf list short even if the model over-produces.
+    topics = [t for t in data.get("topics", []) if isinstance(t, str)][:3]
     category = (data.get("category") or "").strip().lower()
     if category in DOMAIN_TOPICS and category not in [t.lower() for t in topics]:
         topics.append(category)
