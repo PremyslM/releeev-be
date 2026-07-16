@@ -363,6 +363,15 @@ MATCH (c:Capture {id: $id})
 SET c.url = $url
 """
 
+# Link preview: the page's own hero image / self-description, so the source page
+# shows a real card instead of a bare domain.
+SET_CAPTURE_PREVIEW = """
+MATCH (c:Capture {id: $id})
+SET c.og_image = $og_image,
+    c.site_name = $site_name,
+    c.page_description = $page_description
+"""
+
 # ── Capture location (place-anchored memory) ─────────────────────────────────
 SET_CAPTURE_LOCATION = """
 MATCH (c:Capture {id: $id})

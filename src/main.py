@@ -45,6 +45,7 @@ from src.models import (
     CaptureDetailResponse,
     CaptureLink,
     CaptureNode,
+    CaptureType,
     ErrorResponse,
     ExtractedAttributes,
     LinkType,
@@ -530,6 +531,9 @@ def _parse_html(html: str) -> tuple[dict, str]:
         "og:description": meta("og:description"),
         "og:site_name": meta("og:site_name"),
         "description": meta("description", attr="name"),
+        # For the source page's preview card, not the model — analyze_url pops it
+        # out before prompting (an image URL in the prompt is wasted tokens).
+        "og:image": meta("og:image") or meta("twitter:image", attr="name"),
     }
 
     # 1) Best case: clean structured data (recipe ingredients+steps, etc.).
@@ -562,6 +566,18 @@ _TRACKING_PARAMS = {
     "utm_content", "gclid", "gbraid", "wbraid", "gad_source", "gad_campaignid",
     "tracking", "fbclid", "msclkid", "_ga", "mc_cid", "mc_eid",
 }
+
+
+def _abs_url(candidate: str, page_url: str) -> str:
+    """og:image is often relative ("/img/hero.jpg") or protocol-relative — the
+    app needs an absolute URL it can load directly."""
+    from urllib.parse import urljoin
+    candidate = (candidate or "").strip()
+    if not candidate:
+        return ""
+    if candidate.startswith("//"):
+        return "https:" + candidate
+    return urljoin(page_url, candidate)
 
 
 def _strip_tracking(url: str) -> str:
@@ -685,6 +701,11 @@ async def analyze_url(
         signals = {"url path": slug, "site": domain}
         text = slug
 
+    # Preview metadata for the source page — kept out of the model prompt.
+    og_image = _abs_url(signals.pop("og:image", "") or "", url)
+    site_name = signals.get("og:site_name") or domain
+    page_desc = signals.get("og:description") or signals.get("description") or ""
+
     # ── Extract attributes via Claude (text), then run the standard pipeline ──
     try:
         attributes = extractAttributesFromText(text, url, signals, lang=req.lang)
@@ -699,6 +720,8 @@ async def analyze_url(
         await _persist_capture(capture, user_id)
         async with get_session() as session:
             await session.run(Q.SET_CAPTURE_URL, id=capture.id, url=url)
+            await session.run(Q.SET_CAPTURE_PREVIEW, id=capture.id, og_image=og_image,
+                              site_name=site_name, page_description=page_desc[:400])
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Database error: {exc}") from exc
 
@@ -905,6 +928,7 @@ async def get_capture(
             title=node.get("title", ""),
             summary=node.get("summary", ""),
             raw_text=node.get("raw_text", ""),
+            capture_type=node.get("capture_type") or CaptureType.unknown,
             language=node.get("language", "en"),
             sentiment=node.get("sentiment", "neutral"),
             confidence=node.get("confidence", 1.0),
@@ -913,7 +937,14 @@ async def get_capture(
             places=[pl for pl in (record.get("places") or []) if pl],
             kind=node.get("kind", "") or "",
             author=node.get("author", "") or "",
-            extra={"url": node["url"]} if node.get("url") else {},
+            extra={
+                k: v for k, v in (
+                    ("url", node.get("url")),
+                    ("og_image", node.get("og_image")),
+                    ("site_name", node.get("site_name")),
+                    ("page_description", node.get("page_description")),
+                ) if v
+            },
         )
         capture = CaptureNode(
             id=node["id"],
