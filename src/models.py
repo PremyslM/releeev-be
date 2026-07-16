@@ -313,6 +313,9 @@ class TopicDocResponse(BaseModel):
     capture_count: int = 0
     updated_at: datetime | None = None
     sources: list[TopicDocSource] = Field(default_factory=list)
+    # True when `text` predates the current captures. Reads never block on the
+    # model, so the client shows this (slightly old) text at once and refreshes.
+    stale: bool = False
 
 
 class TopicDocSummary(BaseModel):
