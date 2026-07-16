@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from functools import lru_cache
 
@@ -94,6 +95,26 @@ _TOPIC_RULES = (
 )
 
 
+# Languages written in Latin script — for these, any Cyrillic/Greek character in
+# the output is the model bleeding the source language through, never legitimate.
+_LATIN_SCRIPT_LANGS = {
+    "cs", "sk", "en", "de", "pl", "es", "fr", "it", "pt", "nl", "da", "sv",
+    "no", "fi", "hu", "ro", "hr", "sl", "lt", "lv", "et", "tr",
+}
+_FOREIGN_SCRIPT = re.compile(r"[Ѐ-ӿͰ-Ͽ]")   # Cyrillic, Greek
+
+
+def _script_leaked(text: str, lang: str) -> bool:
+    """True when the output contains a script the target language never uses.
+
+    The fast model reliably follows the "write in Czech" instruction for whole
+    sentences but still drops in stray source-language words (e.g. "в равném
+    objemu", "pиву"). A prompt can't fully stop it, so we detect and redo."""
+    if (lang or "").strip().lower() not in _LATIN_SCRIPT_LANGS:
+        return False
+    return bool(_FOREIGN_SCRIPT.search(text or ""))
+
+
 def _lang_instruction(lang: str) -> str:
     """Ask the model to write the human-facing fields in the device language,
     while topics stay canonical English (so related captures share keywords)."""
@@ -110,6 +131,89 @@ def _lang_instruction(lang: str) -> str:
             f'{name}. Keep only "topics" in canonical English.')
 
 
+def _parse_json_reply(resp) -> dict:
+    """Best-effort JSON out of a model reply.
+
+    Models occasionally wrap the object in prose/fences, or emit an unescaped
+    quote inside a value (a poster reading `"středo/věk"` is enough). A failed
+    parse used to silently yield {} — an untitled, unsummarised, unlinkable
+    capture — so tolerate what we safely can and log the rest legibly."""
+    raw = next((b.text for b in resp.content if b.type == "text"), "").strip()
+    if not raw:
+        return {}
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-zA-Z]*\s*", "", raw)
+        raw = re.sub(r"```\s*$", "", raw).strip()
+    start, end = raw.find("{"), raw.rfind("}")
+    if start != -1 and end > start:
+        raw = raw[start : end + 1]
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    try:                                     # drop trailing commas: {"a": 1,}
+        return json.loads(re.sub(r",\s*([}\]])", r"\1", raw))
+    except json.JSONDecodeError as exc:
+        # \n-escape so the whole payload lands on one log line, not just "{".
+        logger.error("Attribute JSON parse failed: %s | Raw: %s",
+                     exc, raw[:600].replace("\n", "\\n"))
+        return {}
+
+
+def _complete_json(
+    *,
+    messages: list,
+    lang: str,
+    max_tokens: int,
+    system: str | None = None,
+    model: str | None = None,
+) -> dict:
+    """Extract on `model` (the cheap one by default), retrying once on the
+    stronger one if the reply was unusable (unparseable / empty) or leaked
+    foreign script into localized text. Both are rare, so cost stays close to
+    single-pass. Vision passes the strong model as primary — images need it."""
+    client = _claude()
+    primary = model or settings.claude_model_fast
+
+    def run(model: str, msgs: list) -> dict:
+        kwargs = {"model": model, "max_tokens": max_tokens, "messages": msgs}
+        if system:
+            kwargs["system"] = system
+        return _parse_json_reply(client.messages.create(**kwargs))
+
+    data = run(primary, messages)
+    blob = f"{data.get('title', '')} {data.get('summary', '')}"
+    broken = not (data.get("title") or data.get("summary"))
+    leaked = _script_leaked(blob, lang)
+    if not broken and not leaked:
+        return data
+
+    reason = "unparseable/empty reply" if broken else f"foreign script in {lang} output"
+    logger.warning("Extraction retry on %s — %s", settings.claude_model, reason)
+    nudge = (
+        "\n\nYour previous attempt was not valid JSON, or was empty. Return ONLY "
+        "the JSON object. Escape every quote inside a string value as \\\", and "
+        "never use a raw newline inside a string."
+        if broken else
+        "\n\nYour previous attempt leaked words in a foreign script (e.g. "
+        "Cyrillic) into the text. Rewrite it so EVERY word is in the target "
+        "language and script. Translate any source-language term; never copy it."
+    )
+    retry_msgs = [dict(m) for m in messages]
+    last = retry_msgs[-1]
+    if isinstance(last.get("content"), str):
+        last["content"] = last["content"] + nudge
+    elif isinstance(last.get("content"), list):
+        last["content"] = last["content"] + [{"type": "text", "text": nudge}]
+
+    strong = run(settings.claude_model, retry_msgs)
+    if not (strong.get("title") or strong.get("summary")):
+        return data                                    # retry no better — keep first
+    if _script_leaked(f"{strong.get('title', '')} {strong.get('summary', '')}", lang):
+        return data if not broken else strong
+    return strong
+
+
 # ── Main functions ────────────────────────────────────────────────────────────
 
 def extractAttributes(
@@ -124,13 +228,13 @@ def extractAttributes(
     from src.link_engine import DOMAIN_TOPICS  # local import: avoids any cycle
 
     t0 = time.perf_counter()
-    client = _claude()
     allowed = ", ".join(sorted(DOMAIN_TOPICS))
 
-    response = client.messages.create(
-        model=settings.claude_model,
-        max_tokens=2048,
+    data = _complete_json(
         system=_SYSTEM,
+        lang=lang,
+        max_tokens=2048,
+        model=settings.claude_model,   # vision quality matters; keep the strong model
         messages=[
             {
                 "role": "user",
@@ -161,18 +265,6 @@ def extractAttributes(
 
     elapsed = (time.perf_counter() - t0) * 1000
     logger.info("extractAttributes completed in %.0f ms", elapsed)
-
-    # Extract the text block (skip thinking blocks)
-    raw_json = next(
-        (block.text for block in response.content if block.type == "text"),
-        "{}",
-    )
-
-    try:
-        data = json.loads(raw_json)
-    except json.JSONDecodeError as exc:
-        logger.error("JSON parse failed: %s\nRaw: %s", exc, raw_json[:300])
-        data = {}
 
     # Map capture_type to enum safely
     ct_raw = data.get("capture_type", "unknown")
@@ -215,7 +307,6 @@ def extractAttributesFromText(
     """
     from src.link_engine import DOMAIN_TOPICS  # local import: avoids any cycle
 
-    client = _claude()
     signals = signals or {}
     sig_lines = "\n".join(f"{k}: {v}" for k, v in signals.items() if v)
     allowed = ", ".join(sorted(DOMAIN_TOPICS))
@@ -241,34 +332,28 @@ Return JSON:
 }}
 
 SUMMARY RULES — extract what's worth keeping, don't just describe the page:
+- Open with 1-2 plain sentences of gist (no heading), then structure the rest.
 - Adapt the shape to the content:
-  • Recipe → an "Ingredients:" bulleted list where EACH bullet includes the
+  • Recipe → an ingredients bulleted list where EACH bullet includes the
     amount/quantity from the page (e.g. "- 500 g potatoes", "- 2 eggs"). If the
     page truly gives no amount for an item, list it without one — never invent
-    quantities. Then a numbered "Steps:" list.
+    quantities. Then a numbered steps list.
   • How-to / tutorial → the key steps or takeaways as a short list.
   • Product → what it is + key specs / price as a few bullets.
   • Article / video → 3-6 bullet key points or conclusions.
-- Draw conclusions; be concrete and skimmable. Use plain bullets ("- ") and
-  "1." numbering, short lines. Keep it tight — no fluff, no "this page shows…".
+- FORMATTING (Markdown, this is rendered — get it right):
+  • Section labels MUST be Markdown headings: "## Ingredients", "## Steps",
+    "## Specs", "## Key points". NEVER write a bare "Label:" line — it renders
+    as flat body text. Translate the heading text into the target language.
+  • Bullets are "- " lines; ordered steps are "1." lines. One item per line,
+    short. Use **bold** only for a single key value, sparingly.
+- Draw conclusions; be concrete and skimmable. Keep it tight — no fluff, no
+  "this page shows…".
 
 {_TOPIC_RULES}{_lang_instruction(lang) or ' Write title and summary in the content language.'}"""
 
-    resp = client.messages.create(
-        model=settings.claude_model_fast,
-        max_tokens=1400,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = next((b.text for b in resp.content if b.type == "text"), "{}").strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        logger.error("URL attribute JSON parse failed: %s\nRaw: %s", exc, raw[:300])
-        data = {}
+    data = _complete_json(messages=[{"role": "user", "content": prompt}],
+                          lang=lang, max_tokens=1400)
 
     # Hard guard: keep the shelf list short even if the model over-produces.
     topics = [t for t in data.get("topics", []) if isinstance(t, str)][:3]
@@ -341,21 +426,8 @@ quotation/aphorism; "task" for a to-do; "question" for an open question; "fact"
 for a factual snippet; else "idea" or "note".
 {_TOPIC_RULES}{_lang_instruction(lang)}"""
 
-    resp = client.messages.create(
-        model=settings.claude_model_fast,
-        max_tokens=600,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = next((b.text for b in resp.content if b.type == "text"), "{}").strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        logger.error("Note attribute JSON parse failed: %s\nRaw: %s", exc, raw[:300])
-        data = {}
+    data = _complete_json(messages=[{"role": "user", "content": prompt}],
+                          lang=lang, max_tokens=600)
 
     # Hard guard: keep the shelf list short even if the model over-produces.
     topics = [t for t in data.get("topics", []) if isinstance(t, str)][:3]
