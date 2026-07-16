@@ -18,7 +18,7 @@ from datetime import datetime
 from functools import lru_cache
 
 import anthropic
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -321,6 +321,7 @@ async def bug_report(
 )
 async def analyze_capture(
     req: AnalyzeCaptureRequest,
+    background: BackgroundTasks,
     user_id: str = Depends(get_current_user),
 ) -> AnalyzeCaptureResponse:
     """
@@ -432,6 +433,10 @@ async def analyze_capture(
     )
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
+
+    # Rewrite the documents this capture just made out of date, after the
+    # response — so opening the topic later is instant, not a 10s model wait.
+    background.add_task(_precompute_topic_docs, user_id, attributes.topics, req.lang)
 
     return AnalyzeCaptureResponse(
         capture_id=capture.id,
@@ -653,6 +658,7 @@ async def _fetch_page(url: str) -> tuple[dict, str]:
           summary="Save a web link: fetch, extract, embed, link")
 async def analyze_url(
     req: AnalyzeUrlRequest,
+    background: BackgroundTasks,
     user_id: str = Depends(get_current_user),
 ) -> AnalyzeCaptureResponse:
     """
@@ -752,6 +758,10 @@ async def analyze_url(
         attributes.summary, linked, user_id,
     )
 
+    # Rewrite the documents this capture just made out of date, after the
+    # response — so opening the topic later is instant, not a 10s model wait.
+    background.add_task(_precompute_topic_docs, user_id, attributes.topics, req.lang)
+
     return AnalyzeCaptureResponse(
         capture_id=capture.id,
         attributes=attributes,
@@ -817,6 +827,7 @@ async def _attach_context(capture_id: str, kind: str, title: str, summary: str,
           summary="Save a typed/dictated note: extract, embed, link")
 async def analyze_note(
     req: AnalyzeNoteRequest,
+    background: BackgroundTasks,
     user_id: str = Depends(get_current_user),
 ) -> AnalyzeCaptureResponse:
     """Third capture type (besides images and URLs): the user's own note. Runs the
@@ -875,6 +886,10 @@ async def analyze_note(
         capture.id, attributes.kind, attributes.title, attributes.summary,
         attributes.raw_text, linked, user_id,
     )
+
+    # Rewrite the documents this capture just made out of date, after the
+    # response — so opening the topic later is instant, not a 10s model wait.
+    background.add_task(_precompute_topic_docs, user_id, attributes.topics, req.lang)
 
     return AnalyzeCaptureResponse(
         capture_id=capture.id, attributes=attributes, embedding_dim=len(embedding),
@@ -1427,20 +1442,60 @@ async def list_topic_docs(user_id: str = Depends(get_current_user)) -> TopicDocL
     ])
 
 
+async def _compile_topic_doc(user_id: str, topic: str, lang: str) -> str:
+    """Compile and persist a topic's document. Safe to call in the background:
+    it never raises, so a failed recompile just leaves the previous text."""
+    try:
+        async with get_session() as s:
+            rec = await s.run(Q.TOPIC_CAPTURES, uid=user_id, topic=topic, limit=60)
+            rows = [r async for r in rec]
+        if len(rows) < _TOPIC_DOC_MIN_CAPTURES:
+            return ""
+        items = [
+            (str(_to_native(r["created_at"]))[:10], r["kind"] or "",
+             r["title"] or "", r["summary"] or "")
+            for r in rows
+        ]
+        loop = asyncio.get_running_loop()
+        text = await loop.run_in_executor(None, _topic_doc_blocking, topic, items, lang)
+        if text:
+            async with get_session() as s:
+                await s.run(Q.UPSERT_TOPIC_DOC, uid=user_id, topic=topic,
+                            text=text, capture_count=len(rows))
+        return text
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Topic doc compile failed for %r (non-fatal): %s", topic, exc)
+        return ""
+
+
+async def _precompute_topic_docs(user_id: str, topics: list[str], lang: str) -> None:
+    """After a capture lands, refresh the documents it just made out of date, so
+    the user never opens a topic and waits for the model."""
+    for topic in {t.strip().lower() for t in topics if t.strip()}:
+        await _compile_topic_doc(user_id, topic, lang)
+
+
 @app.get("/topics/{name}/doc", response_model=TopicDocResponse,
          summary="A topic's living document — compiled from your captures, rewritten as they grow")
 async def topic_doc(
     name: str,
+    background: BackgroundTasks,
     lang: str = "",
     refresh: bool = False,
     user_id: str = Depends(get_current_user),
 ) -> TopicDocResponse:
-    """Compiled knowledge for one topic. Cached in the graph and recompiled only
-    when the topic gains captures, so re-reads are free."""
+    """Compiled knowledge for one topic.
+
+    A read must never wait on the model. If we have any text — even text that
+    predates the newest captures — it comes back at once, flagged `stale`, and
+    the rewrite happens after the response. Only a topic that has never been
+    compiled has to block, and the write path normally gets there first.
+    """
     topic = name.strip().lower()
     async with get_session() as s:
         rec = await s.run(Q.TOPIC_CAPTURES, uid=user_id, topic=topic, limit=60)
         rows = [r async for r in rec]
+        cached = await (await s.run(Q.GET_TOPIC_DOC, uid=user_id, topic=topic)).single()
 
     sources = [
         TopicDocSource(capture_id=r["id"], title=r["title"] or "",
@@ -1451,35 +1506,25 @@ async def topic_doc(
         # Too thin to compile: the captures themselves are still the better read.
         return TopicDocResponse(topic=topic, text="", capture_count=len(rows), sources=sources)
 
-    async with get_session() as s:
-        cached = await (await s.run(Q.GET_TOPIC_DOC, uid=user_id, topic=topic)).single()
-    if cached and cached["text"] and not refresh and cached["capture_count"] == len(rows):
+    has_text = bool(cached and cached["text"])
+    fresh = has_text and cached["capture_count"] == len(rows)
+
+    if has_text and not refresh:
+        if not fresh:
+            background.add_task(_compile_topic_doc, user_id, topic, lang)
         return TopicDocResponse(
             topic=topic, text=cached["text"], capture_count=len(rows),
             updated_at=_to_native(cached["updated_at"]), sources=sources,
+            stale=not fresh,
         )
 
-    items = [
-        (str(_to_native(r["created_at"]))[:10], r["kind"] or "", r["title"] or "", r["summary"] or "")
-        for r in rows
-    ]
-    try:
-        loop = asyncio.get_running_loop()
-        text = await loop.run_in_executor(None, _topic_doc_blocking, topic, items, lang)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Topic doc generation failed (non-fatal): %s", exc)
-        # Serve a stale doc rather than nothing.
-        if cached and cached["text"]:
-            return TopicDocResponse(
-                topic=topic, text=cached["text"], capture_count=cached["capture_count"],
-                updated_at=_to_native(cached["updated_at"]), sources=sources,
-            )
-        return TopicDocResponse(topic=topic, text="", capture_count=len(rows), sources=sources)
-
-    if text:
-        async with get_session() as s:
-            await s.run(Q.UPSERT_TOPIC_DOC, uid=user_id, topic=topic,
-                        text=text, capture_count=len(rows))
+    # Never compiled (or an explicit refresh) — this is the one blocking path.
+    text = await _compile_topic_doc(user_id, topic, lang)
+    if not text and has_text:
+        return TopicDocResponse(
+            topic=topic, text=cached["text"], capture_count=cached["capture_count"],
+            updated_at=_to_native(cached["updated_at"]), sources=sources, stale=True,
+        )
     return TopicDocResponse(topic=topic, text=text, capture_count=len(rows),
                             updated_at=datetime.utcnow(), sources=sources)
 
