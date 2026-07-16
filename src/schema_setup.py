@@ -35,6 +35,8 @@ INDEXES = [
 
     # Range index on timestamp for temporal queries
     "CREATE INDEX capture_created IF NOT EXISTS FOR (n:Capture) ON (n.created_at)",
+    # Living topic documents are looked up per (user, topic) on every read.
+    "CREATE INDEX topicdoc_key IF NOT EXISTS FOR (n:TopicDoc) ON (n.user_id, n.topic)",
 
     # Vector index for embedding similarity  (Neo4j 5.x+)
     # voyage-3 returns 1024-dimensional vectors

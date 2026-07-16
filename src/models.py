@@ -298,6 +298,33 @@ class JournalEntry(BaseModel):
     captures: list[JournalCapture] = Field(default_factory=list)
 
 
+class TopicDocSource(BaseModel):
+    """A capture the living document was compiled from."""
+    capture_id: str
+    title: str = ""
+    created_at: datetime | None = None
+
+
+class TopicDocResponse(BaseModel):
+    """A topic's living document: the user's captures on that topic, compiled
+    into one piece of knowledge that rewrites itself as they add more."""
+    topic: str
+    text: str = ""              # markdown; "" while there's too little to compile
+    capture_count: int = 0
+    updated_at: datetime | None = None
+    sources: list[TopicDocSource] = Field(default_factory=list)
+
+
+class TopicDocSummary(BaseModel):
+    topic: str
+    capture_count: int = 0
+    has_doc: bool = False
+
+
+class TopicDocList(BaseModel):
+    topics: list[TopicDocSummary] = Field(default_factory=list)
+
+
 class LocationSummary(BaseModel):
     """A place where captures were made — a memory hub."""
     name: str
