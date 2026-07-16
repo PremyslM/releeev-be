@@ -14,6 +14,7 @@ import logging
 import time
 from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
+from datetime import datetime
 from functools import lru_cache
 
 import anthropic
@@ -65,10 +66,15 @@ from src.models import (
     SubjectSibling,
     Theme,
     ThemeListResponse,
+    TopicDocList,
+    TopicDocResponse,
+    TopicDocSource,
+    TopicDocSummary,
 )
 from src.neo4j_driver import close_driver, get_session
 from src.schema_setup import run_schema_setup
 from src.vision_extractor import (
+    _lang_instruction,
     extractAttributes,
     extractAttributesFromNote,
     extractAttributesFromText,
@@ -1275,6 +1281,49 @@ async def list_locations(
 _JOURNAL_CACHE: dict[tuple[str, str], tuple[int, str]] = {}   # (uid,date) → (count, entry)
 
 
+_TOPIC_DOC_MIN_CAPTURES = 3      # below this there's nothing to compile
+
+
+def _topic_doc_blocking(topic: str, items: list[tuple[str, str, str, str]], lang: str) -> str:
+    """Compile a topic's captures into ONE living document.
+
+    The point of the feature: stop making the user re-read 14 logs about coffee.
+    This states what they know and where they've landed, so the topic page is
+    knowledge — not a list of links. Items are (date, kind, title, summary),
+    oldest first, so the model can see how their thinking moved."""
+    if not items:
+        return ""
+    lines = "\n".join(
+        f"- [{date}{('/' + kind) if kind else ''}] {title}: {summary}"[:400]
+        for date, kind, title, summary in items
+    )
+    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    resp = client.messages.create(
+        model=settings.claude_model,      # synthesis quality matters here
+        max_tokens=1200,
+        system=(
+            "You compile a person's own captures on ONE topic into a single living "
+            "document — their compiled knowledge, not a list of what they saved.\n\n"
+            "Write it as if THEY wrote up everything they know on this topic:\n"
+            "- Lead with 1-2 sentences of where they actually stand today.\n"
+            "- Then '## ' sections that fit the material. Good ones are usually: "
+            "what they've settled on / what they own or chose, what they're still "
+            "deciding, and useful specifics worth keeping (numbers, names, prices).\n"
+            "- Prefer conclusions over inventory. 'You brew with a V60 and grind on "
+            "a Comandante' beats 'You saved 3 links about grinders'.\n"
+            "- Where entries conflict or their view changed over time, say so — that "
+            "is the most valuable thing you can surface.\n"
+            "- Never invent anything not in the captures. No preamble, no '#' title "
+            "(the app shows the topic name). Markdown: '## ' headings, '- ' bullets, "
+            "**bold** sparingly. Keep it tight — this is a reference, not an essay."
+            + (_lang_instruction(lang) if lang else "")
+        ),
+        messages=[{"role": "user", "content":
+                   f"Topic: {topic}\n\nTheir captures, oldest first:\n{lines}"}],
+    )
+    return next((b.text for b in resp.content if b.type == "text"), "").strip()
+
+
 def _journal_entry_blocking(date: str, items: list[tuple[str, str, str, str]]) -> str:
     """Write a short, warm journal entry organising a day's captures. Each item
     is (capture_type, kind, title, summary). Markdown; the user's language."""
@@ -1358,6 +1407,81 @@ async def journal_day(
     if entry:
         _JOURNAL_CACHE[(user_id, date)] = (len(captures), entry)
     return JournalEntry(date=date, entry=entry, captures=captures)
+
+
+@app.get("/topics", response_model=TopicDocList,
+         summary="Topics with enough captures to have a living document")
+async def list_topic_docs(user_id: str = Depends(get_current_user)) -> TopicDocList:
+    async with get_session() as s:
+        rec = await s.run(Q.USER_TOPICS, uid=user_id,
+                          min_captures=_TOPIC_DOC_MIN_CAPTURES, limit=40)
+        rows = [r async for r in rec]
+        docs = set()
+        for r in rows:
+            d = await (await s.run(Q.GET_TOPIC_DOC, uid=user_id, topic=r["name"])).single()
+            if d and d["text"]:
+                docs.add(r["name"])
+    return TopicDocList(topics=[
+        TopicDocSummary(topic=r["name"], capture_count=r["cnt"], has_doc=r["name"] in docs)
+        for r in rows
+    ])
+
+
+@app.get("/topics/{name}/doc", response_model=TopicDocResponse,
+         summary="A topic's living document — compiled from your captures, rewritten as they grow")
+async def topic_doc(
+    name: str,
+    lang: str = "",
+    refresh: bool = False,
+    user_id: str = Depends(get_current_user),
+) -> TopicDocResponse:
+    """Compiled knowledge for one topic. Cached in the graph and recompiled only
+    when the topic gains captures, so re-reads are free."""
+    topic = name.strip().lower()
+    async with get_session() as s:
+        rec = await s.run(Q.TOPIC_CAPTURES, uid=user_id, topic=topic, limit=60)
+        rows = [r async for r in rec]
+
+    sources = [
+        TopicDocSource(capture_id=r["id"], title=r["title"] or "",
+                       created_at=_to_native(r["created_at"]))
+        for r in rows
+    ]
+    if len(rows) < _TOPIC_DOC_MIN_CAPTURES:
+        # Too thin to compile: the captures themselves are still the better read.
+        return TopicDocResponse(topic=topic, text="", capture_count=len(rows), sources=sources)
+
+    async with get_session() as s:
+        cached = await (await s.run(Q.GET_TOPIC_DOC, uid=user_id, topic=topic)).single()
+    if cached and cached["text"] and not refresh and cached["capture_count"] == len(rows):
+        return TopicDocResponse(
+            topic=topic, text=cached["text"], capture_count=len(rows),
+            updated_at=_to_native(cached["updated_at"]), sources=sources,
+        )
+
+    items = [
+        (str(_to_native(r["created_at"]))[:10], r["kind"] or "", r["title"] or "", r["summary"] or "")
+        for r in rows
+    ]
+    try:
+        loop = asyncio.get_running_loop()
+        text = await loop.run_in_executor(None, _topic_doc_blocking, topic, items, lang)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Topic doc generation failed (non-fatal): %s", exc)
+        # Serve a stale doc rather than nothing.
+        if cached and cached["text"]:
+            return TopicDocResponse(
+                topic=topic, text=cached["text"], capture_count=cached["capture_count"],
+                updated_at=_to_native(cached["updated_at"]), sources=sources,
+            )
+        return TopicDocResponse(topic=topic, text="", capture_count=len(rows), sources=sources)
+
+    if text:
+        async with get_session() as s:
+            await s.run(Q.UPSERT_TOPIC_DOC, uid=user_id, topic=topic,
+                        text=text, capture_count=len(rows))
+    return TopicDocResponse(topic=topic, text=text, capture_count=len(rows),
+                            updated_at=datetime.utcnow(), sources=sources)
 
 
 @app.get("/entities/{kind}/{name}", response_model=EntityDetailResponse,

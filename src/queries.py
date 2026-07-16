@@ -552,6 +552,46 @@ ORDER BY c.created_at DESC
 LIMIT $limit
 """
 
+# ── Living topic documents ───────────────────────────────────────────────────
+# A topic's captures for this user, oldest first so the compiled document reads
+# as the story of how their thinking developed.
+TOPIC_CAPTURES = """
+MATCH (t:Topic {name: $topic})<-[:HAS_TOPIC]-(c:Capture)
+WHERE c.user_id = $uid
+RETURN c.id           AS id,
+       c.title        AS title,
+       c.summary      AS summary,
+       c.kind         AS kind,
+       c.capture_type AS capture_type,
+       c.created_at   AS created_at
+ORDER BY c.created_at ASC
+LIMIT $limit
+"""
+
+# The compiled document is cached per (user, topic). Topic nodes are global, so
+# it can't live on the Topic itself — TopicDoc is the user's own copy.
+GET_TOPIC_DOC = """
+MATCH (d:TopicDoc {user_id: $uid, topic: $topic})
+RETURN d.text AS text, d.capture_count AS capture_count, d.updated_at AS updated_at
+"""
+
+UPSERT_TOPIC_DOC = """
+MERGE (d:TopicDoc {user_id: $uid, topic: $topic})
+SET d.text = $text, d.capture_count = $capture_count, d.updated_at = datetime()
+"""
+
+# The user's topics by how many of THEIR captures use them (t.capture_count is a
+# global counter shared across users, so it can't be trusted for this).
+USER_TOPICS = """
+MATCH (c:Capture)-[:HAS_TOPIC]->(t:Topic)
+WHERE c.user_id = $uid
+WITH t.name AS name, count(c) AS cnt
+WHERE cnt >= $min_captures
+RETURN name, cnt
+ORDER BY cnt DESC, name ASC
+LIMIT $limit
+"""
+
 # ── Faceted search: fetch filterable fields for a set of candidate captures ──
 GET_CAPTURE_FACETS = """
 MATCH (c:Capture)
