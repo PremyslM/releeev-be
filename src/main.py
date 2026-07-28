@@ -2071,6 +2071,19 @@ async def retopic_all(
         # rebuild links from the new shelves — search/themes/graph stay coherent.
         result["reembed"] = await reembed_all(force=True, user_id=user_id)
         result["relink"] = await relink_all(user_id=user_id)
+
+        # Warm the living documents for every now-qualifying topic, so the first
+        # open after the migration is instant instead of a ~10s compile. The old
+        # docs were compiled from the old (narrow) shelves, so they're stale now.
+        async with get_session() as session:
+            topics = [r["name"] async for r in await session.run(
+                Q.USER_TOPICS, uid=user_id, min_captures=_TOPIC_DOC_MIN_CAPTURES, limit=40)]
+        warmed = 0
+        for topic in topics:
+            if await _compile_topic_doc(user_id, topic, lang=""):
+                warmed += 1
+        result["docs_warmed"] = warmed
+
     result["message"] = f"Přetopikováno {changed}/{len(rows)} záznamů (chyby: {failed})."
     return result
 
