@@ -283,6 +283,13 @@ RETURN c.id AS id, c.title AS title, c.summary AS summary,
 ORDER BY c.created_at ASC
 """
 
+# All of a user's captures with their stored text — for the topic backfill.
+GET_ALL_CAPTURES_TEXT = """
+MATCH (c:Capture) WHERE c.user_id = $uid
+RETURN c.id AS id, c.title AS title, c.summary AS summary, c.raw_text AS raw_text
+ORDER BY c.created_at ASC
+"""
+
 UPDATE_EMBEDDING = """
 MATCH (c:Capture {id: $id})
 SET c.embedding = $embedding

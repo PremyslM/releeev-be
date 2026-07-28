@@ -214,6 +214,53 @@ def _complete_json(
     return strong
 
 
+def extractTopicsOnly(title: str, summary: str, raw_text: str = "") -> dict:
+    """Re-derive ONLY the shelves (category/topics/people/places) from a capture's
+    stored text, using the broad-topic rule. Keeps the existing title/summary.
+
+    The single source of truth for "what shelves does this go on", shared by the
+    per-capture reanalyze and the whole-brain backfill — so neither drifts back to
+    the old narrow-topic behaviour."""
+    from src.link_engine import DOMAIN_TOPICS
+
+    allowed = ", ".join(sorted(DOMAIN_TOPICS))
+    prompt = f"""Re-derive the metadata for this saved note. Return ONLY valid JSON.
+
+Title: {title}
+Summary: {summary}
+Raw text: {raw_text[:800]}
+
+{{
+  "category": "<exactly ONE of: {allowed}>",
+  "topics":   ["<1-3 broad English topic keywords — see Topics rule>"],
+  "people":   ["<real person names mentioned, or []>"],
+  "places":   ["<real place names / brands mentioned, or []>"]
+}}
+
+{_TOPIC_RULES}"""
+
+    resp = _claude().messages.create(
+        model=settings.claude_model_fast,
+        max_tokens=250,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    data = _parse_json_reply(resp)   # no title/summary in the reply → parse directly
+
+    topics = [t for t in data.get("topics", []) if isinstance(t, str)][:3]
+    category = (data.get("category") or "").strip().lower()
+    if category in DOMAIN_TOPICS:
+        if category not in [t.lower() for t in topics]:
+            topics.append(category)
+    else:
+        category = ""
+    return {
+        "category": category,
+        "topics": topics,
+        "people": [p for p in data.get("people", []) if isinstance(p, str)][:10],
+        "places": [pl for pl in data.get("places", []) if isinstance(pl, str)][:10],
+    }
+
+
 # ── Main functions ────────────────────────────────────────────────────────────
 
 def extractAttributes(
