@@ -78,6 +78,7 @@ from src.vision_extractor import (
     extractAttributes,
     extractAttributesFromNote,
     extractAttributesFromText,
+    extractTopicsOnly,
     getEmbedding,
 )
 
@@ -1975,75 +1976,17 @@ async def reanalyze_topics(capture_id: str, user_id: str = Depends(get_current_u
     if not summary and not raw_text:
         raise HTTPException(status_code=422, detail="No text content to analyze")
 
-    # Call Claude to extract structured attributes from text
-    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
-    prompt = f"""Extract structured metadata from this screenshot content. Return ONLY valid JSON, no explanation.
-
-Title: {title}
-Summary: {summary}
-Raw extracted text: {raw_text[:800]}
-
-Return JSON with:
-{{
-  "category": "<exactly ONE value from the allowed list below>",
-  "topics": ["<6-10 specific English topic keywords>"],
-  "people": ["<real person names mentioned, or []>"],
-  "places": ["<real place names or brands, or []>"]
-}}
-
-Allowed "category" values — pick the SINGLE best fit (coarse domain of the subject):
-automotive, programming, electronics, computers, mobile, gaming, photography,
-appliances, furniture, home, kitchen, tools, garden,
-fashion, watches, jewelry, beauty, health, sports,
-food, travel, music, entertainment, books, movies,
-finance, education, office, toys, pets, baby
-
-Category guidance (be CONSISTENT so similar items share a category):
-- Use the real-world domain of the SUBJECT, not the fact that it's a web page/shop.
-- ALL clothing, footwear, sportswear, apparel (shoes, sneakers, shorts, jackets) → "fashion"
-- "sports" ONLY for sports equipment, fitness gear, sporting events/content (not clothing)
-- Washing machine, oven, fridge, dishwasher, microwave → "appliances"
-- Laptop/phone/TV/camera → "electronics"; sofa/table/bed → "furniture"
-- Pick the closest match even if imperfect; this enables weak category-level links.
-
-Rules for topics:
-- Use canonical/standardized English terms so related captures share the same keywords
-- If content is clearly about a known brand/product, include it (e.g. 'Tesla', 'YouTube', 'Steam', 'Java')
-- Group synonyms: use 'electric vehicle' (not both 'electric car' AND 'electric vehicle')
-- 'Premium Long Range', WLTP range, rear-wheel drive pricing → almost certainly Tesla configurator → add topic 'Tesla'
-- Prefer specific over generic: 'Tesla Model 3' > 'car'; 'Java programming' > 'code'
-- Do NOT put the category word itself into topics — it is returned separately"""
-
+    # Broad-topic re-derivation — shared with the whole-brain backfill.
     try:
-        resp = client.messages.create(
-            model=settings.claude_model_fast,
-            max_tokens=300,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw_json = next((b.text.strip() for b in resp.content if b.type == "text"), "{}")
-        # Strip markdown code fences if present
-        if raw_json.startswith("```"):
-            raw_json = raw_json.split("```")[1]
-            if raw_json.startswith("json"):
-                raw_json = raw_json[4:]
-        import json as _json
-        extracted = _json.loads(raw_json)
-    except Exception as exc:
+        extracted = await asyncio.to_thread(
+            extractTopicsOnly, title, summary, raw_text)
+    except anthropic.APIError as exc:
         raise HTTPException(status_code=502, detail=f"Claude extraction failed: {exc}") from exc
 
-    new_topics  = [t for t in extracted.get("topics", []) if isinstance(t, str)][:15]
-    new_people  = [p for p in extracted.get("people", []) if isinstance(p, str)][:10]
-    new_places  = [pl for pl in extracted.get("places", []) if isinstance(pl, str)][:10]
-
-    # Validate category against the controlled vocabulary; store as a Topic too
-    from src.link_engine import DOMAIN_TOPICS
-    category = (extracted.get("category") or "").strip().lower()
-    if category and category in DOMAIN_TOPICS:
-        # Add the domain tag as a topic so it participates in linking
-        if category not in [t.lower() for t in new_topics]:
-            new_topics.append(category)
-    else:
-        category = ""  # invalid / missing — skip
+    new_topics = extracted["topics"]
+    new_people = extracted["people"]
+    new_places = extracted["places"]
+    category = extracted["category"]
 
     # Persist new topics/people/places to Neo4j
     async with get_session() as session:
@@ -2076,6 +2019,73 @@ Rules for topics:
         "places":  new_places,
         "note": "Run POST /reembed to refresh embeddings (batched, avoids rate limit)",
     }
+
+
+@app.post("/retopic-all", summary="Backfill broad topics across the whole brain")
+async def retopic_all(
+    relink: bool = Query(default=True, description="Also re-embed + relink afterwards"),
+    user_id: str = Depends(get_current_user),
+):
+    """One-shot migration: re-derive every capture's topics with the current
+    BROAD-shelf rule, so data captured under the old narrow-topic behaviour stops
+    fragmenting themes/folders/living-documents into single-member buckets.
+
+    Rewrites HAS_TOPIC/MENTIONS per capture, then (by default) re-embeds and
+    relinks so search, themes and the graph reflect the new shelves in one call.
+    Topic re-derivation is text-only on the fast model — no images, no Voyage."""
+    async with get_session() as session:
+        rows = [r async for r in await session.run(Q.GET_ALL_CAPTURES_TEXT, uid=user_id)]
+
+    changed = 0
+    failed = 0
+    for r in rows:
+        title = r["title"] or ""
+        summary = r["summary"] or ""
+        raw_text = r["raw_text"] or ""
+        if not (summary or raw_text or title):
+            continue
+        try:
+            ex = await asyncio.to_thread(extractTopicsOnly, title, summary, raw_text)
+        except Exception as exc:  # noqa: BLE001 — one bad capture shouldn't abort the batch
+            logger.warning("retopic-all: %s failed: %s", r["id"][:8], exc)
+            failed += 1
+            continue
+        if not ex["topics"]:
+            continue
+        async with get_session() as session:
+            await session.run(
+                "MATCH (c:Capture {id: $id})-[rel:HAS_TOPIC|MENTIONS]->() DELETE rel",
+                id=r["id"],
+            )
+            for t in ex["topics"]:
+                await session.run(Q.UPSERT_TOPIC, name=t, capture_id=r["id"])
+            for p in ex["people"]:
+                await session.run(Q.UPSERT_PERSON, name=p, capture_id=r["id"])
+            for pl in ex["places"]:
+                await session.run(Q.UPSERT_PLACE, name=pl, capture_id=r["id"])
+        changed += 1
+
+    result = {"status": "done", "captures": len(rows), "retopiced": changed, "failed": failed}
+    if relink:
+        # Embeddings are built from title+summary+topics, so refresh them, then
+        # rebuild links from the new shelves — search/themes/graph stay coherent.
+        result["reembed"] = await reembed_all(force=True, user_id=user_id)
+        result["relink"] = await relink_all(user_id=user_id)
+
+        # Warm the living documents for every now-qualifying topic, so the first
+        # open after the migration is instant instead of a ~10s compile. The old
+        # docs were compiled from the old (narrow) shelves, so they're stale now.
+        async with get_session() as session:
+            topics = [r["name"] async for r in await session.run(
+                Q.USER_TOPICS, uid=user_id, min_captures=_TOPIC_DOC_MIN_CAPTURES, limit=40)]
+        warmed = 0
+        for topic in topics:
+            if await _compile_topic_doc(user_id, topic, lang=""):
+                warmed += 1
+        result["docs_warmed"] = warmed
+
+    result["message"] = f"Přetopikováno {changed}/{len(rows)} záznamů (chyby: {failed})."
+    return result
 
 
 # ── Re-embed all captures (fixes zero embeddings from before Voyage AI key) ──
