@@ -996,6 +996,8 @@ async def get_capture(
                     other_summary=row.get("other_summary") or "",
                     shared_topics=shared,
                     reasons=[r for r in (row.get("reasons") or []) if r],
+                    rel_kind=row.get("rel_kind") or "",
+                    rel_why=row.get("rel_why") or "",
                 )
             )
 

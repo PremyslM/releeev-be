@@ -191,6 +191,8 @@ MATCH (a:Capture {id: $source_id}), (b:Capture {id: $target_id})
 MERGE (a)-[r:LINKED_TO {type: $link_type}]->(b)
 SET   r.strength = $strength,
       r.reasons = $reasons,
+      r.rel_kind = $rel_kind,
+      r.rel_why = $rel_why,
       r.updated_at = datetime()
 """
 
@@ -224,6 +226,8 @@ OPTIONAL MATCH (c)-[:HAS_TOPIC]->(t:Topic)<-[:HAS_TOPIC]-(other)
 RETURN r.type       AS link_type,
        r.strength   AS strength,
        r.reasons    AS reasons,
+       r.rel_kind   AS rel_kind,
+       r.rel_why    AS rel_why,
        other.id     AS other_id,
        other.title  AS other_title,
        other.summary AS other_summary,
