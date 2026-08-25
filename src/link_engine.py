@@ -3,6 +3,7 @@ Linking engine — similarity computation + graph-based capture matching.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 from dataclasses import dataclass, field
@@ -372,9 +373,115 @@ async def findSimilarCaptures(
         )
 
     # Keep only each capture's strongest, most-specific links — no node becomes a
-    # hub of dozens of weak edges.
+    # hub of dozens of weak edges. Bound the candidate set before the model pass.
     links.sort(key=lambda x: x.strength, reverse=True)
+    links = links[: max(settings.max_links_per_capture * 2, 8)]
+
+    # Turn mechanical links into semantic ones (relationship kind + human "why"),
+    # re-ranked by meaning and pruned of coincidental overlaps.
+    links = await _enrich_links(attributes.title, attributes.summary, links)
     return links[: settings.max_links_per_capture]
+
+
+# ── Semantic enrichment: what KIND of link, and one honest "why" ────────────────
+
+_REL_KINDS = {"same_thing", "component", "builds_on", "tension", "context", "related"}
+
+
+def _enrich_blocking(
+    new_title: str, new_summary: str, candidates: list[LinkedCapture]
+) -> dict[str, dict] | None:
+    """One model pass over a capture's candidate links. For each, decide whether a
+    thoughtful person would really draw the line, classify the relationship, and
+    write a concrete one-sentence 'why'. Returns {capture_id: {...}} or None on
+    failure (caller then keeps the mechanical links unchanged)."""
+    from src.config import settings
+    from src.vision_extractor import _claude, _parse_json_reply  # local: avoid cycle
+
+    listing = "\n".join(
+        f"[{i}] id={l.capture_id} | {l.title} | {(l.summary or '')[:200]}"
+        for i, l in enumerate(candidates, 1)
+    )
+    prompt = f"""You connect a person's OWN notes into a knowledge graph. A new note was just saved. For each candidate below, decide whether a thoughtful person would actually draw a line between them — and if so, what kind of line.
+
+NEW NOTE
+title: {new_title}
+summary: {(new_summary or '')[:400]}
+
+CANDIDATES
+{listing}
+
+Return ONLY JSON:
+{{"links":[{{"id":"<candidate id>","keep":true,"kind":"same_thing|component|builds_on|tension|context|related","why":"<one concrete sentence>","relevance":0.0}}]}}
+
+Rules:
+- keep=false when the overlap is generic or coincidental (just a shared broad category). Be strict — a clean graph beats a busy one.
+- kind: "same_thing" = two records of the same object/event; "component" = one is a part/aspect of the other (a grinder of a coffee setup); "builds_on" = one continues or refines the other; "tension" = they conflict; "context" = same place/time/occasion; else "related".
+- IMPORTANT: if the two notes state DIFFERENT amounts, prices, budgets, dates, or opinions about the same thing, that is a "tension" — choose "tension" over "component"/"related", and the why should name the conflict (e.g. "Rozpočet 5000 Kč tady vs. 3000 Kč na celou sestavu").
+- why: ONE specific sentence naming the ACTUAL connection, written in the SAME LANGUAGE as the notes. Never "shared topic X" — say what genuinely ties them.
+- relevance: how much this link helps understand the new note (1.0 essential … 0.2 tenuous)."""
+
+    try:
+        resp = _claude().messages.create(
+            model=settings.claude_model_fast,
+            max_tokens=800,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Link enrichment call failed (non-fatal): %s", exc)
+        return None
+
+    data = _parse_json_reply(resp)
+    rows = data.get("links")
+    if not isinstance(rows, list):
+        return None
+    out: dict[str, dict] = {}
+    for r in rows:
+        if not isinstance(r, dict) or not r.get("id"):
+            continue
+        kind = str(r.get("kind", "related")).strip().lower()
+        try:
+            rel = float(r.get("relevance", 0.5))
+        except (TypeError, ValueError):
+            rel = 0.5
+        out[str(r["id"])] = {
+            "keep": bool(r.get("keep", True)),
+            "kind": kind if kind in _REL_KINDS else "related",
+            "why": str(r.get("why", "")).strip(),
+            "relevance": max(0.0, min(1.0, rel)),
+        }
+    return out
+
+
+async def _enrich_links(
+    new_title: str, new_summary: str, links: list[LinkedCapture]
+) -> list[LinkedCapture]:
+    """Turn mechanical links into semantic ones: relationship kind + human 'why',
+    re-ranked by how meaningful each is. Drops links the model judges coincidental.
+    On any failure, returns the input unchanged so linking never breaks."""
+    if not links:
+        return links
+    loop = asyncio.get_running_loop()
+    enriched = await loop.run_in_executor(
+        None, _enrich_blocking, new_title, new_summary, links)
+    if enriched is None:
+        return links  # model unavailable → keep mechanical links
+
+    kept: list[LinkedCapture] = []
+    for link in links:
+        e = enriched.get(link.capture_id)
+        if e is None:
+            kept.append(link)          # model didn't rate it → keep as-is
+            continue
+        if not e["keep"] or not e["why"]:
+            continue                   # coincidental / no honest reason → drop
+        link.rel_kind = e["kind"]
+        link.rel_why = e["why"]
+        link.reasons = [e["why"]]      # the human sentence replaces the labels
+        link.strength = round(e["relevance"], 4)   # meaning now drives Top-N order
+        kept.append(link)
+    kept.sort(key=lambda x: x.strength, reverse=True)
+    return kept
 
 
 # ── Persist links ─────────────────────────────────────────────────────────────
@@ -395,5 +502,7 @@ async def persistLinks(
                 link_type=link.link_type.value,
                 strength=link.strength,
                 reasons=link.reasons,
+                rel_kind=link.rel_kind,
+                rel_why=link.rel_why,
             )
     logger.info("Persisted %d links from %s", len(links), source_id)

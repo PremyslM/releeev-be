@@ -85,6 +85,8 @@ class CaptureLink(BaseModel):
     other_summary: str = ""
     shared_topics: list[str] = Field(default_factory=list)
     reasons: list[str] = Field(default_factory=list)  # why these are linked
+    rel_kind: str = ""   # semantic relationship kind (see LinkedCapture)
+    rel_why: str = ""    # one concrete sentence naming the actual connection
 
 
 # ── API request / response models ─────────────────────────────────────────────
@@ -136,6 +138,9 @@ class LinkedCapture(BaseModel):
     title: str = ""
     summary: str = ""
     reasons: list[str] = Field(default_factory=list)  # why these are linked
+    # Semantic edge — what KIND of relationship this is and a human "why".
+    rel_kind: str = ""   # same_thing | component | builds_on | tension | context | related
+    rel_why: str = ""    # one concrete sentence naming the actual connection
 
 
 class AnalyzeCaptureResponse(BaseModel):

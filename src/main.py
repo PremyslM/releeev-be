@@ -970,6 +970,9 @@ async def get_capture(
         )
         capture = CaptureNode(
             id=node["id"],
+            # Read the stored creation time — without this, CaptureNode's
+            # default_factory stamps *now*, so every detail showed today's date.
+            created_at=_to_native(node.get("created_at")) or datetime.utcnow(),
             image_hash=node.get("image_hash", ""),
             attributes=attrs,
             embedding=list(node.get("embedding") or []),
@@ -996,6 +999,8 @@ async def get_capture(
                     other_summary=row.get("other_summary") or "",
                     shared_topics=shared,
                     reasons=[r for r in (row.get("reasons") or []) if r],
+                    rel_kind=row.get("rel_kind") or "",
+                    rel_why=row.get("rel_why") or "",
                 )
             )
 
@@ -1638,6 +1643,7 @@ _RRF_K = 60
 _RRF_WEIGHTS = {"semantic": 1.0, "fulltext": 0.7, "topic": 1.3}
 _SEMANTIC_MIN = 0.45     # voyage query↔doc floor; below this is noise, not a match
 _MIN_RESULT_SCORE = 0.40  # drop results scoring below 40% of the top match
+_FALLBACK_MIN_SCORE = 0.65  # stricter band used when the reranker couldn't vet
 
 
 @app.get(
@@ -1775,6 +1781,7 @@ async def search_captures(
     # of every loosely-fused hit). The top match is always kept. Non-fatal: any
     # error keeps the RRF order. Only the top window is reranked; the tail (beyond
     # the window) is dropped for precision.
+    reranked_ok = False
     if settings.rerank_enabled and len(relevant) > 1:
         window = relevant[: settings.rerank_candidates]
         docs = [
@@ -1787,8 +1794,18 @@ async def search_captures(
             floor = settings.rerank_min_score
             kept = [(cid, sc) for cid, sc in reranked if sc >= floor]
             relevant = kept or reranked[:1]   # never return nothing when we had a match
+            reranked_ok = True
         except Exception as exc:
             logger.warning("Rerank failed (using RRF order): %s", exc)
+
+    # Fallback precision: when the cross-encoder couldn't vet the results — reranker
+    # disabled, rate-limited (Voyage free tier is 3 RPM), or a single candidate —
+    # the loose 40%-of-top band is the only filter, and for a short query it lets a
+    # coincidental lexical match through. Tighten to the items genuinely close to
+    # the top so an unrelated log stops surfacing. The top match is always kept.
+    if not reranked_ok and len(relevant) > 1:
+        top = relevant[0][1] or 1.0
+        relevant = [(cid, sc) for cid, sc in relevant if sc / top >= _FALLBACK_MIN_SCORE]
 
     # ── Fetch structured fields for the relevant matches (one batched lookup) ──
     facet_map: dict[str, dict] = {}
