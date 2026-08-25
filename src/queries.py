@@ -310,6 +310,15 @@ ORDER BY c.created_at DESC
 LIMIT $limit
 """
 
+# Bug-report screenshots — stored here (not committed into the git repo) and
+# served by an unguessable id so GitHub can embed them in the issue.
+CREATE_BUG_IMAGE = """
+CREATE (b:BugImage {id: $id, data: $data, created_at: datetime()})
+"""
+GET_BUG_IMAGE = """
+MATCH (b:BugImage {id: $id}) RETURN b.data AS data
+"""
+
 # Flag a just-persisted capture whose embedding came back empty (all zeros).
 SET_NEEDS_EMBEDDING = """
 MATCH (c:Capture {id: $id})

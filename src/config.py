@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     # GITHUB_TOKEN needs `repo` scope; GITHUB_REPO is "owner/name".
     github_token: str = ""
     github_repo: str = ""
+    # Public base URL of this backend (e.g. https://releeev-be.vercel.app), used to
+    # build links GitHub can fetch (bug screenshots). Falls back to the request host.
+    public_base_url: str = ""
 
     # Run the idempotent schema bootstrap on startup. Safe to leave on locally;
     # on serverless (Vercel) set RUN_SCHEMA_SETUP=false after creating the schema

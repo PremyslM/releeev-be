@@ -9,6 +9,7 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import logging
 import time
@@ -18,7 +19,8 @@ from datetime import datetime
 from functools import lru_cache
 
 import anthropic
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -258,6 +260,7 @@ async def claim_orphans(user_id: str = Depends(get_current_user)):
           summary="File an in-app bug report as a GitHub issue")
 async def bug_report(
     req: BugReportRequest,
+    request: Request,
     user_id: str = Depends(get_current_user),
 ) -> BugReportResponse:
     """
@@ -281,22 +284,20 @@ async def bug_report(
     }
     body = [req.description.strip() or "_(bez popisu)_"]
 
-    async with httpx.AsyncClient(timeout=20) as client:
-        # Optional screenshot: commit it into the repo, then embed its raw URL.
-        if req.image_base64:
-            path = f"bug-reports/{uuid4().hex}.jpg"
-            try:
-                up = await client.put(
-                    f"{api}/contents/{path}", headers=headers,
-                    json={"message": f"chore: bug screenshot {path}", "content": req.image_base64},
-                )
-                if up.status_code in (200, 201):
-                    dl = (up.json().get("content") or {}).get("download_url")
-                    if dl:
-                        body.append(f"\n\n![screenshot]({dl})")
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Bug screenshot upload failed (non-fatal): %s", exc)
+    # Optional screenshot: store it in the DB (NOT committed into the repo) and
+    # embed a link the GitHub issue can fetch — no repo-history bloat.
+    if req.image_base64:
+        img_id = uuid4().hex
+        try:
+            async with get_session() as session:
+                await session.run(Q.CREATE_BUG_IMAGE, id=img_id, data=req.image_base64)
+            base = (settings.public_base_url or str(request.base_url)).rstrip("/")
+            base = base.replace("http://", "https://")   # GitHub only proxies https
+            body.append(f"\n\n![screenshot]({base}/bug-image/{img_id})")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Bug screenshot store failed (non-fatal): %s", exc)
 
+    async with httpx.AsyncClient(timeout=20) as client:
         meta = []
         if req.app_version: meta.append(f"app: `{req.app_version}`")
         if req.device: meta.append(f"device: `{req.device}`")
@@ -317,6 +318,24 @@ async def bug_report(
                             detail=f"GitHub API {issue.status_code}: {issue.text[:200]}")
     data = issue.json()
     return BugReportResponse(url=data["html_url"], number=data["number"])
+
+
+@app.get("/bug-image/{img_id}", summary="Serve a stored bug screenshot (public, unguessable id)")
+async def bug_image(img_id: str) -> Response:
+    """Public so GitHub can render the screenshot in the issue. The id is an
+    unguessable uuid; there is nothing sensitive to enumerate."""
+    if not img_id.isalnum():
+        raise HTTPException(status_code=400, detail="Bad id.")
+    async with get_session() as session:
+        rec = await (await session.run(Q.GET_BUG_IMAGE, id=img_id)).single()
+    if rec is None or not rec["data"]:
+        raise HTTPException(status_code=404, detail="Not found.")
+    try:
+        raw = base64.b64decode(rec["data"])
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail="Corrupt image.") from exc
+    return Response(content=raw, media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=31536000"})
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
