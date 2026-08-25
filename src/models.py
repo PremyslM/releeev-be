@@ -127,8 +127,11 @@ class UpdateCaptureRequest(BaseModel):
 
 
 class ReanalyzeRequest(BaseModel):
-    """Ask the model to re-extract a capture from its source (URL or note text)."""
+    """Ask the model to re-extract a capture from its source. For a photo the
+    image lives only on the device, so the client re-sends it here."""
     lang: str = ""                  # device language ISO code — write records in it
+    image_base64: str | None = None  # for photo captures: the on-device image
+    image_mime: str = "image/jpeg"
 
 
 class LinkedCapture(BaseModel):

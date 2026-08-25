@@ -1099,10 +1099,10 @@ async def reanalyze_capture(
     req: ReanalyzeRequest,
     user_id: str = Depends(get_current_user),
 ) -> CaptureDetailResponse:
-    """Re-run extraction against whatever source the capture still has — the
-    web page (re-fetched) or the note text. Handy when an early extraction was
-    poor, or to refresh old captures with an improved extractor. Photos can't be
-    re-analyzed here (their image lives only on the device)."""
+    """Re-run extraction against whatever source the capture has — a photo (the
+    client re-sends the on-device image), the web page (re-fetched), or the note
+    text. Handy when an early extraction was poor, or to refresh old captures
+    with an improved extractor."""
     async with get_session() as session:
         rec = await (await session.run(Q.GET_CAPTURE_BY_ID, id=capture_id, uid=user_id)).single()
         if rec is None:
@@ -1112,7 +1112,13 @@ async def reanalyze_capture(
     url = node.get("url") or ""
     raw_text = node.get("raw_text") or ""
 
-    if url:
+    if req.image_base64:
+        # Photo: re-run vision extraction on the image the device sent back.
+        try:
+            attrs = extractAttributes(req.image_base64, req.image_mime, lang=req.lang)
+        except anthropic.APIError as exc:
+            raise HTTPException(status_code=502, detail=f"Claude API error: {exc}") from exc
+    elif url:
         signals: dict = {}
         text = ""
         try:
@@ -1157,6 +1163,13 @@ async def reanalyze_capture(
             await session.run(Q.UPSERT_PERSON, name=p, capture_id=capture_id)
         for pl in attrs.places:
             await session.run(Q.UPSERT_PLACE, name=pl, capture_id=capture_id)
+        # Topics + embedding changed, so the old links are stale — rebuild them.
+        await session.run("MATCH (c:Capture {id: $id})-[r:LINKED_TO]-() DELETE r", id=capture_id)
+
+    if any(v != 0.0 for v in (embedding or [])[:10]):
+        linked = await findSimilarCaptures(capture_id, attrs, embedding)
+        if linked:
+            await persistLinks(capture_id, linked)
 
     return await get_capture(capture_id, user_id)
 
