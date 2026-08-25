@@ -197,6 +197,12 @@ async def _persist_capture(capture: CaptureNode, user_id: str) -> None:
         for place in attrs.places:
             await session.run(Q.UPSERT_PLACE, name=place, capture_id=capture.id)
 
+        # If the embedding came back empty (Voyage rate limit), flag the capture
+        # so the background drain re-embeds and relinks it — no permanently
+        # unlinkable, unsearchable record.
+        zero = not any(v != 0.0 for v in (capture.embedding or [])[:16])
+        await session.run(Q.SET_NEEDS_EMBEDDING, id=capture.id, flag=zero)
+
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -438,6 +444,7 @@ async def analyze_capture(
     # Rewrite the documents this capture just made out of date, after the
     # response — so opening the topic later is instant, not a 10s model wait.
     background.add_task(_precompute_topic_docs, user_id, attributes.topics, req.lang)
+    background.add_task(_drain_pending_embeddings, user_id)
 
     return AnalyzeCaptureResponse(
         capture_id=capture.id,
@@ -762,6 +769,7 @@ async def analyze_url(
     # Rewrite the documents this capture just made out of date, after the
     # response — so opening the topic later is instant, not a 10s model wait.
     background.add_task(_precompute_topic_docs, user_id, attributes.topics, req.lang)
+    background.add_task(_drain_pending_embeddings, user_id)
 
     return AnalyzeCaptureResponse(
         capture_id=capture.id,
@@ -891,6 +899,7 @@ async def analyze_note(
     # Rewrite the documents this capture just made out of date, after the
     # response — so opening the topic later is instant, not a 10s model wait.
     background.add_task(_precompute_topic_docs, user_id, attributes.topics, req.lang)
+    background.add_task(_drain_pending_embeddings, user_id)
 
     return AnalyzeCaptureResponse(
         capture_id=capture.id, attributes=attributes, embedding_dim=len(embedding),
@@ -1479,6 +1488,39 @@ async def _precompute_topic_docs(user_id: str, topics: list[str], lang: str) -> 
     the user never opens a topic and waits for the model."""
     for topic in {t.strip().lower() for t in topics if t.strip()}:
         await _compile_topic_doc(user_id, topic, lang)
+
+
+async def _drain_pending_embeddings(user_id: str, limit: int = 12) -> None:
+    """Heal captures whose embedding failed under a Voyage rate-limit spike:
+    re-embed them in ONE batched request (durable client, backs off), then relink.
+    Runs in the background after each capture, so a burst self-heals over the next
+    few captures instead of leaving dead, unlinkable records."""
+    try:
+        async with get_session() as s:
+            rows = [r async for r in await s.run(
+                Q.LIST_PENDING_EMBEDDINGS, uid=user_id, limit=limit)]
+        if not rows:
+            return
+        from src.vision_extractor import getEmbeddingsBatch
+        texts = [f"{(r['title'] or '')} {(r['summary'] or '')}".strip() or " " for r in rows]
+        loop = asyncio.get_running_loop()
+        embeddings = await loop.run_in_executor(None, getEmbeddingsBatch, texts)
+
+        healed = 0
+        for r, emb in zip(rows, embeddings):
+            if not any(v != 0.0 for v in emb[:10]):
+                continue  # still rate-limited — stays flagged for the next drain
+            async with get_session() as s:
+                await s.run(Q.UPDATE_EMBEDDING, id=r["id"], embedding=emb)  # clears the flag
+            attrs = ExtractedAttributes(title=r["title"] or "", summary=r["summary"] or "")
+            linked = await findSimilarCaptures(r["id"], attrs, emb)
+            if linked:
+                await persistLinks(r["id"], linked)
+            healed += 1
+        if healed:
+            logger.info("Drained %d pending embeddings for %s", healed, user_id[:8])
+    except Exception as exc:  # noqa: BLE001 — background heal must never surface
+        logger.warning("Pending-embedding drain failed (non-fatal): %s", exc)
 
 
 @app.get("/topics/{name}/doc", response_model=TopicDocResponse,

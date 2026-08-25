@@ -30,11 +30,40 @@ def _claude() -> anthropic.Anthropic:
 
 @lru_cache(maxsize=1)
 def _voyage() -> voyageai.Client:
-    # Use VOYAGE_API_KEY if set, otherwise try ANTHROPIC_API_KEY
+    # Interactive path (search rerank). max_retries=0: on the free tier's 3 RPM
+    # limit, fail fast (~100ms) and degrade gracefully instead of blocking search.
     key = settings.voyage_api_key or settings.anthropic_api_key
-    # max_retries=0: on the free tier's 3 RPM limit, fail fast (~100ms) instead
-    # of letting tenacity back-off for ~1.7s and blocking the search request.
     return voyageai.Client(api_key=key, max_retries=0)
+
+
+@lru_cache(maxsize=1)
+def _voyage_durable() -> voyageai.Client:
+    # Embedding path (ingest / reembed). A missing embedding is a broken capture
+    # (zero vector ⇒ no links, no semantic search), so here we let the SDK back
+    # off and retry through a rate-limit spike rather than fail fast.
+    key = settings.voyage_api_key or settings.anthropic_api_key
+    return voyageai.Client(api_key=key, max_retries=3)
+
+
+def _embed_with_retry(texts: list[str], attempts: int = 3, pause: float = 6.0):
+    """Embed on the durable client, retrying a rate-limit spike with a bounded
+    wait. Raises on final failure so the caller can flag the capture for the
+    background drain instead of silently storing a zero vector."""
+    import time
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            return _voyage_durable().embed(texts=texts, model="voyage-3", input_type="document")
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            msg = str(exc).lower()
+            transient = "rate" in msg or "429" in msg or "timeout" in msg or "connection" in msg
+            if not transient or i == attempts - 1:
+                raise
+            logger.warning("Voyage embed rate-limited, retry %d/%d in %.0fs",
+                           i + 1, attempts, pause)
+            time.sleep(pause)
+    raise last  # unreachable, keeps type checkers happy
 
 
 # ── Extraction prompt ─────────────────────────────────────────────────────────
@@ -513,15 +542,11 @@ def getEmbedding(text: str) -> list[float]:
         return [0.0] * 1024
 
     try:
-        vc = _voyage()
-        result = vc.embed(
-            texts=[text],
-            model="voyage-3",
-            input_type="document",
-        )
-        return result.embeddings[0]
+        return _embed_with_retry([text]).embeddings[0]
     except Exception as exc:  # noqa: BLE001
-        logger.error("getEmbedding failed: %s", exc)
+        # Zero vector keeps downstream code alive; the capture is flagged
+        # needs_embedding on persist and healed by the background drain.
+        logger.error("getEmbedding failed after retries: %s", exc)
         return [0.0] * 1024
 
 
@@ -543,12 +568,7 @@ def getEmbeddingsBatch(texts: list[str]) -> list[list[float]]:
     safe = [t if t.strip() else " " for t in texts]
 
     try:
-        vc = _voyage()
-        result = vc.embed(
-            texts=safe,
-            model="voyage-3",
-            input_type="document",
-        )
+        result = _embed_with_retry(safe)
         out: list[list[float]] = []
         for i, emb in enumerate(result.embeddings):
             out.append([0.0] * 1024 if not texts[i].strip() else emb)

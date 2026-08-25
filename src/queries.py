@@ -296,7 +296,24 @@ ORDER BY c.created_at ASC
 
 UPDATE_EMBEDDING = """
 MATCH (c:Capture {id: $id})
-SET c.embedding = $embedding
+SET c.embedding = $embedding, c.needs_embedding = false
+"""
+
+# Captures whose embedding failed (rate limit) and need a background retry.
+LIST_PENDING_EMBEDDINGS = """
+MATCH (c:Capture)
+WHERE c.user_id = $uid AND c.needs_embedding = true
+OPTIONAL MATCH (c)-[:HAS_TOPIC]->(t:Topic)
+WITH c, collect(t.name) AS topics
+RETURN c.id AS id, c.title AS title, c.summary AS summary, topics
+ORDER BY c.created_at DESC
+LIMIT $limit
+"""
+
+# Flag a just-persisted capture whose embedding came back empty (all zeros).
+SET_NEEDS_EMBEDDING = """
+MATCH (c:Capture {id: $id})
+SET c.needs_embedding = $flag
 """
 
 # ── Delete all LINKED_TO relationships (before full relink) ──────────────────
