@@ -970,6 +970,9 @@ async def get_capture(
         )
         capture = CaptureNode(
             id=node["id"],
+            # Read the stored creation time — without this, CaptureNode's
+            # default_factory stamps *now*, so every detail showed today's date.
+            created_at=_to_native(node.get("created_at")) or datetime.utcnow(),
             image_hash=node.get("image_hash", ""),
             attributes=attrs,
             embedding=list(node.get("embedding") or []),
