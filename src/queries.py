@@ -324,6 +324,9 @@ MATCH (b:BugImage {id: $id}) RETURN b.data AS data
 SET_EXTRACTION_PATH = """
 MATCH (c:Capture {id: $id}) SET c.extraction_path = $path
 """
+SET_CAPTURE_CAMERA = """
+MATCH (c:Capture {id: $id}) SET c.camera = $camera
+"""
 EXTRACTION_PATH_STATS = """
 MATCH (c:Capture) WHERE c.user_id = $uid AND c.extraction_path IS NOT NULL
 RETURN c.extraction_path AS path, count(c) AS n

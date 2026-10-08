@@ -445,6 +445,8 @@ async def analyze_capture(
         async with get_session() as session:
             await session.run(Q.SET_EXTRACTION_PATH, id=capture.id,
                               path="ocr" if use_ocr else "vision")
+            if req.camera:
+                await session.run(Q.SET_CAPTURE_CAMERA, id=capture.id, camera=req.camera[:120])
     except Exception as exc:
         logger.error("Neo4j persist error: %s", exc)
         raise HTTPException(status_code=503, detail=f"Database error: {exc}") from exc
@@ -1108,7 +1110,8 @@ async def get_capture(
 
     return CaptureDetailResponse(capture=capture, connections=connections,
                                  subject=subject, location=location,
-                                 context=node.get("context", "") or "")
+                                 context=node.get("context", "") or "",
+                                 camera=node.get("camera", "") or "")
 
 
 @app.delete("/captures/{capture_id}", summary="Delete a capture")

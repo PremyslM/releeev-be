@@ -100,6 +100,7 @@ class AnalyzeCaptureRequest(BaseModel):
     )
     ocr_text: str | None = None     # on-device OCR, sent INSTEAD of the image
     image_hash: str | None = None   # sha256 of the base64 image, so the OCR path dedups too
+    camera: str | None = None       # "Apple iPhone 15 Pro – Main Camera 24 mm" (from EXIF)
     image_mime: str = Field(
         default="image/jpeg",
         pattern=r"^image/(jpeg|png|webp|gif)$",
@@ -189,6 +190,7 @@ class CaptureDetailResponse(BaseModel):
     subject: SubjectInfo | None = None
     location: LocationInfo | None = None
     context: str = ""                # personalised insight: how it fits your brain
+    camera: str = ""                 # camera that took the photo (EXIF), "" if unknown
 
 
 class SearchResult(BaseModel):
