@@ -122,6 +122,20 @@ async def lifespan(_app: FastAPI):
             await run_schema_setup()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Schema setup skipped (non-fatal): %s", exc)
+    else:
+        # Even with setup off (fast cold starts), a brand-new database — e.g. a
+        # replaced Aura instance — must not run schemaless: search then dies on
+        # "no such fulltext schema index". One cheap probe; full setup if missing.
+        try:
+            async with get_session() as session:
+                found = await (await session.run(
+                    "SHOW INDEXES YIELD name WHERE name = 'capture_fulltext' RETURN count(*) AS n"
+                )).single()
+            if not found or found["n"] == 0:
+                logger.warning("Schema missing (fresh database?) — running schema setup")
+                await run_schema_setup()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Schema probe skipped (non-fatal): %s", exc)
     yield
     await close_driver()
     logger.info("Brain Graph API shut down.")
