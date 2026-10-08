@@ -193,6 +193,44 @@ class CaptureDetailResponse(BaseModel):
     camera: str = ""                 # camera that took the photo (EXIF), "" if unknown
 
 
+# ── Backup / restore ─────────────────────────────────────────────────────────────
+
+class BackupItem(BaseModel):
+    """One capture as exported / imported. A cached `GET /captures/{id}` response
+    is a valid item too — its extra keys (connections, subject) are ignored — so
+    a device can restore straight from its offline cache."""
+    capture: CaptureNode
+    location: LocationInfo | None = None
+    context: str = ""
+    camera: str = ""
+
+
+class BackupFile(BaseModel):
+    """Everything a user has captured, as one file that /import can restore."""
+    version: int = 1
+    exported_at: datetime = Field(default_factory=datetime.utcnow)
+    count: int = 0
+    items: list[BackupItem] = Field(default_factory=list)
+
+
+class ImportRequest(BaseModel):
+    # Small batches keep each request well inside the serverless time limit.
+    items: list[BackupItem] = Field(default_factory=list, max_length=100)
+
+
+class ImportResponse(BaseModel):
+    imported: int = 0
+    skipped: int = 0                 # already in the database — import is idempotent
+    embedded: int = 0                # vectors recomputed during the import
+    ids: list[str] = Field(default_factory=list)   # newly imported capture ids
+
+
+class RestoreAccountRequest(BaseModel):
+    """Recreate the account row for a still-valid session after a database loss."""
+    email: str
+    password: str = Field(min_length=6)
+
+
 class SearchResult(BaseModel):
     capture_id: str
     title: str

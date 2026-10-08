@@ -654,3 +654,37 @@ RETURN c.id           AS id,
        c.created_at   AS created_at,
        collect(toLower(t.name)) AS topics
 """
+
+
+# ── Backup / restore / ops ──────────────────────────────────────────────────────
+
+# Every capture of a user with its topics / people / places. The embedding is
+# dropped unless asked for: 1024 floats per record would dwarf the content and
+# is cheap to recompute on import.
+EXPORT_CAPTURES = """
+MATCH (c:Capture) WHERE c.user_id = $uid
+OPTIONAL MATCH (c)-[:HAS_TOPIC]->(t:Topic)
+WITH c, collect(DISTINCT t.name) AS topics
+OPTIONAL MATCH (c)-[:MENTIONS]->(p:Person)
+WITH c, topics, collect(DISTINCT p.name) AS people
+OPTIONAL MATCH (c)-[:MENTIONS]->(pl:Place)
+WITH c, topics, people, collect(DISTINCT pl.name) AS places
+RETURN CASE WHEN $embeddings THEN c {.*} ELSE c {.*, embedding: null} END AS c,
+       topics, people, places
+ORDER BY c.created_at
+"""
+
+CAPTURE_OWNER = """
+MATCH (c:Capture {id: $id}) RETURN c.user_id AS uid
+"""
+
+GET_USER_BY_ID = """
+MATCH (u:User {id: $id}) RETURN u.id AS id, u.email AS email
+"""
+
+# A daily write that keeps an Aura Free instance from being paused as idle.
+HEARTBEAT = """
+MERGE (h:Heartbeat {id: 'keepalive'})
+SET h.at = datetime(), h.beats = coalesce(h.beats, 0) + 1
+RETURN h.beats AS beats
+"""

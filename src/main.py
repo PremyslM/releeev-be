@@ -19,7 +19,7 @@ from datetime import datetime
 from functools import lru_cache
 
 import anthropic
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -38,6 +38,11 @@ from src.models import (
     AskResponse,
     AskSource,
     AuthResponse,
+    BackupFile,
+    BackupItem,
+    ImportRequest,
+    ImportResponse,
+    RestoreAccountRequest,
     BugReportRequest,
     BugReportResponse,
     LoginRequest,
@@ -238,7 +243,37 @@ async def login(req: LoginRequest) -> AuthResponse:
 
 @app.get("/auth/me", summary="Who am I (validates the token)")
 async def whoami(user_id: str = Depends(get_current_user)):
-    return {"user_id": user_id}
+    # `account`: does this token's user still exist in the database? False after
+    # a database loss — the session is valid, but logging in again would fail
+    # until /auth/restore-account recreates the row. None if the DB is down.
+    account: bool | None = None
+    try:
+        async with get_session() as session:
+            account = (await (await session.run(Q.GET_USER_BY_ID, id=user_id)).single()) is not None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("whoami: account lookup failed: %s", exc)
+    return {"user_id": user_id, "account": account}
+
+
+@app.post("/auth/restore-account", response_model=AuthResponse,
+          summary="Recreate the account for a still-valid session after a database loss")
+async def restore_account(
+    req: RestoreAccountRequest, user_id: str = Depends(get_current_user),
+) -> AuthResponse:
+    """The token was signed by us for `user_id`, but that user's row is gone
+    (e.g. the database was lost). Recreate it under the SAME id with a new
+    password, so restored captures stay this account's and login works again."""
+    email = req.email.strip().lower()
+    if "@" not in email or "." not in email:
+        raise HTTPException(status_code=400, detail="Neplatný e-mail.")
+    async with get_session() as session:
+        if (await (await session.run(Q.GET_USER_BY_ID, id=user_id)).single()) is not None:
+            raise HTTPException(status_code=409, detail="Účet už existuje.")
+        if (await (await session.run(Q.GET_USER_BY_EMAIL, email=email)).single()) is not None:
+            raise HTTPException(status_code=409, detail="Tento e-mail už používá jiný účet.")
+        await session.run(Q.CREATE_USER, id=user_id, email=email,
+                          password_hash=hash_password(req.password))
+    return AuthResponse(token=create_token(user_id), user_id=user_id, email=email)
 
 
 @app.post("/auth/claim-orphans",
@@ -992,6 +1027,33 @@ async def recent_captures(
     return SearchResponse(query="", results=results, total=len(results), facets={})
 
 
+def _attrs_from_node(node, record) -> ExtractedAttributes:
+    """A stored Capture node (+ its topics/people/places from the record) back
+    into ExtractedAttributes — shared by the detail and the export."""
+    return ExtractedAttributes(
+        title=node.get("title", "") or "",
+        summary=node.get("summary", "") or "",
+        raw_text=node.get("raw_text", "") or "",
+        capture_type=node.get("capture_type") or CaptureType.unknown,
+        language=node.get("language", "en") or "en",
+        sentiment=node.get("sentiment", "neutral") or "neutral",
+        confidence=node.get("confidence", 1.0) if node.get("confidence") is not None else 1.0,
+        topics=[t for t in (record.get("topics") or []) if t],
+        people=[p for p in (record.get("people") or []) if p],
+        places=[pl for pl in (record.get("places") or []) if pl],
+        kind=node.get("kind", "") or "",
+        author=node.get("author", "") or "",
+        extra={
+            k: v for k, v in (
+                ("url", node.get("url")),
+                ("og_image", node.get("og_image")),
+                ("site_name", node.get("site_name")),
+                ("page_description", node.get("page_description")),
+            ) if v
+        },
+    )
+
+
 @app.get(
     "/captures/{capture_id}",
     response_model=CaptureDetailResponse,
@@ -1012,28 +1074,7 @@ async def get_capture(
         node = record["c"]
 
         # Parse attributes — topics/people/places come from related nodes in graph
-        attrs = ExtractedAttributes(
-            title=node.get("title", ""),
-            summary=node.get("summary", ""),
-            raw_text=node.get("raw_text", ""),
-            capture_type=node.get("capture_type") or CaptureType.unknown,
-            language=node.get("language", "en"),
-            sentiment=node.get("sentiment", "neutral"),
-            confidence=node.get("confidence", 1.0),
-            topics=[t for t in (record.get("topics") or []) if t],
-            people=[p for p in (record.get("people") or []) if p],
-            places=[pl for pl in (record.get("places") or []) if pl],
-            kind=node.get("kind", "") or "",
-            author=node.get("author", "") or "",
-            extra={
-                k: v for k, v in (
-                    ("url", node.get("url")),
-                    ("og_image", node.get("og_image")),
-                    ("site_name", node.get("site_name")),
-                    ("page_description", node.get("page_description")),
-                ) if v
-            },
-        )
+        attrs = _attrs_from_node(node, record)
         capture = CaptureNode(
             id=node["id"],
             # Read the stored creation time — without this, CaptureNode's
@@ -2752,7 +2793,155 @@ async def get_graph_data(user_id: str = Depends(get_current_user)):
 
 @app.get("/health", include_in_schema=False)
 async def health():
-    return {"status": "ok", "env": settings.app_env}
+    """Liveness INCLUDING the database. A plain 200 here once hid a deleted Aura
+    instance for weeks — now a dead DB answers 503."""
+    async def ping() -> None:
+        async with get_session() as session:
+            await (await session.run("RETURN 1 AS ok")).single()
+    try:
+        await asyncio.wait_for(ping(), timeout=8)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Health: database unreachable: %s", exc)
+        return JSONResponse(status_code=503, content={
+            "status": "degraded", "env": settings.app_env, "db": type(exc).__name__,
+        })
+    return {"status": "ok", "env": settings.app_env, "db": "ok"}
+
+
+@app.get("/cron/keepalive", include_in_schema=False)
+async def cron_keepalive(authorization: str = Header(default="")):
+    """Daily write (Vercel Cron) so an Aura Free instance never sits idle long
+    enough to be paused — a long-paused free instance gets deleted."""
+    if settings.cron_secret:
+        if authorization != f"Bearer {settings.cron_secret}":
+            raise HTTPException(status_code=401, detail="Bad cron secret.")
+    elif settings.is_production:
+        raise HTTPException(status_code=503, detail="CRON_SECRET is not configured.")
+    async with get_session() as session:
+        rec = await (await session.run(Q.HEARTBEAT)).single()
+    return {"ok": True, "beats": rec["beats"] if rec else 0}
+
+
+# ── Backup / restore ──────────────────────────────────────────────────────────
+
+@app.get("/export", response_model=BackupFile,
+         summary="Everything you've captured, as one restorable file")
+async def export_brain(
+    embeddings: bool = Query(False, description="Include the 1024-dim vectors"),
+    user_id: str = Depends(get_current_user),
+) -> BackupFile:
+    items: list[BackupItem] = []
+    async with get_session() as session:
+        result = await session.run(Q.EXPORT_CAPTURES, uid=user_id, embeddings=embeddings)
+        async for rec in result:
+            node = rec["c"]
+            capture = CaptureNode(
+                id=node["id"],
+                created_at=_to_native(node.get("created_at")) or datetime.utcnow(),
+                image_hash=node.get("image_hash", "") or "",
+                attributes=_attrs_from_node(node, rec),
+                embedding=list(node.get("embedding") or []) if embeddings else [],
+            )
+            location = None
+            if node.get("lat") is not None and node.get("lon") is not None:
+                location = LocationInfo(
+                    lat=float(node["lat"]), lon=float(node["lon"]),
+                    place=node.get("place") or "", locality=node.get("locality") or "",
+                    captured_at=node.get("captured_at"),
+                )
+            items.append(BackupItem(capture=capture, location=location,
+                                    context=node.get("context", "") or "",
+                                    camera=node.get("camera", "") or ""))
+    return BackupFile(count=len(items), items=items)
+
+
+async def _link_imported(entries: list[tuple[str, ExtractedAttributes, list[float]]]) -> None:
+    """Draw links for freshly imported captures (after the response). Each later
+    batch links back to the earlier ones, so a batched restore ends up fully linked."""
+    for cid, attrs, emb in entries:
+        if not any(v != 0.0 for v in (emb or [])[:10]):
+            continue
+        try:
+            linked = await findSimilarCaptures(cid, attrs, emb)
+            if linked:
+                await persistLinks(cid, linked)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Import relink failed for %s: %s", cid[:8], exc)
+
+
+@app.post("/import", response_model=ImportResponse,
+          summary="Restore captures from a backup (or a device's offline cache)")
+async def import_brain(
+    req: ImportRequest,
+    background: BackgroundTasks,
+    user_id: str = Depends(get_current_user),
+) -> ImportResponse:
+    """Recreate captures with their ORIGINAL ids and dates — so photos the device
+    keeps by capture id still match. Idempotent: ids already present are
+    skipped, so an interrupted restore can simply be run again."""
+    fresh: list[CaptureNode] = []
+    skipped = 0
+    for item in req.items:
+        cap = item.capture
+        if not cap.id:
+            continue
+        async with get_session() as session:
+            owner = await (await session.run(Q.CAPTURE_OWNER, id=cap.id)).single()
+        if owner is not None:
+            skipped += 1          # already restored (or someone else's id) — never overwrite
+            continue
+        if len(cap.embedding or []) != 1024:
+            cap.embedding = [0.0] * 1024      # flagged needs_embedding by the persist
+        await _persist_capture(cap, user_id)
+
+        extra = cap.attributes.extra or {}
+        async with get_session() as session:
+            if extra.get("url"):
+                await session.run(Q.SET_CAPTURE_URL, id=cap.id, url=extra["url"])
+            if any(extra.get(k) for k in ("og_image", "site_name", "page_description")):
+                await session.run(Q.SET_CAPTURE_PREVIEW, id=cap.id,
+                                  og_image=extra.get("og_image") or "",
+                                  site_name=extra.get("site_name") or "",
+                                  page_description=extra.get("page_description") or "")
+            loc = item.location
+            if loc is not None:
+                await session.run(Q.SET_CAPTURE_LOCATION, id=cap.id, lat=loc.lat, lon=loc.lon,
+                                  place=loc.place, locality=loc.locality,
+                                  captured_at=loc.captured_at)
+                if loc.place:
+                    await session.run(Q.UPSERT_LOCATION, id=cap.id, name=loc.place,
+                                      locality=loc.locality, lat=loc.lat, lon=loc.lon)
+            if item.context:
+                await session.run(Q.SET_CAPTURE_CONTEXT, id=cap.id, context=item.context)
+            if item.camera:
+                await session.run(Q.SET_CAPTURE_CAMERA, id=cap.id, camera=item.camera[:120])
+        fresh.append(cap)
+
+    # Records without a vector (exports omit them) → one batched embedding call.
+    embedded = 0
+    missing = [c for c in fresh if not any(v != 0.0 for v in c.embedding[:16])]
+    if missing:
+        from src.vision_extractor import getEmbeddingsBatch
+        texts = [(f"{c.attributes.title} {c.attributes.summary} "
+                  f"{' '.join(c.attributes.topics)}").strip() or " " for c in missing]
+        try:
+            vectors = await asyncio.get_running_loop().run_in_executor(
+                None, getEmbeddingsBatch, texts)
+        except Exception as exc:  # noqa: BLE001 — stays flagged; the drain heals it
+            logger.warning("Import embedding failed (left for the drain): %s", exc)
+            vectors = []
+        for c, vec in zip(missing, vectors):
+            if any(v != 0.0 for v in vec[:10]):
+                async with get_session() as session:
+                    await session.run(Q.UPDATE_EMBEDDING, id=c.id, embedding=vec)
+                c.embedding = vec
+                embedded += 1
+
+    background.add_task(_link_imported, [(c.id, c.attributes, c.embedding) for c in fresh])
+    background.add_task(_drain_pending_embeddings, user_id)
+    logger.info("Import: %d new, %d skipped, %d embedded", len(fresh), skipped, embedded)
+    return ImportResponse(imported=len(fresh), skipped=skipped, embedded=embedded,
+                          ids=[c.id for c in fresh])
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

@@ -54,6 +54,11 @@ class Settings(BaseSettings):
     # once, so cold starts don't re-run it.
     run_schema_setup: bool = True
 
+    # Shared secret Vercel Cron sends as "Authorization: Bearer <CRON_SECRET>".
+    # Guards /cron/keepalive, the daily write that keeps an Aura Free instance
+    # from being paused (and, after a long pause, deleted).
+    cron_secret: str = ""
+
     # Search reranking — a Voyage cross-encoder reorders the fused candidate set
     # for sharper top results. Falls back to the RRF order on any error.
     rerank_enabled: bool = True
@@ -96,6 +101,9 @@ class Settings(BaseSettings):
                 warnings.append("ANTHROPIC_API_KEY is empty — capture analysis will fail.")
             if self.neo4j_password in ("", "neo4j", "changeme", "12345678"):
                 warnings.append("NEO4J_PASSWORD looks like a placeholder/default.")
+            if not self.cron_secret:
+                warnings.append("CRON_SECRET is empty — the keepalive cron is refused, so an "
+                                "idle Aura Free instance can be paused and later deleted.")
         return fatal, warnings
 
 
