@@ -1,6 +1,7 @@
 """
 Centralised settings — reads from .env / environment variables.
 """
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -27,7 +28,9 @@ class Settings(BaseSettings):
 
     # Neo4j
     neo4j_uri: str = "bolt://localhost:7687"
-    neo4j_user: str = "neo4j"
+    # Aura's downloadable credentials file says NEO4J_USERNAME; accept both, so
+    # pasting that file into Vercel can't silently fall back to "neo4j" (AuthError).
+    neo4j_user: str = Field("neo4j", validation_alias=AliasChoices("NEO4J_USER", "NEO4J_USERNAME"))
     neo4j_password: str = "neo4j"
     neo4j_database: str = "neo4j"
 
