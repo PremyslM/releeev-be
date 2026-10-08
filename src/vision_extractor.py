@@ -454,6 +454,79 @@ SUMMARY RULES — extract what's worth keeping, don't just describe the page:
     )
 
 
+def extractAttributesFromScreenshotText(ocr_text: str, lang: str = "") -> ExtractedAttributes:
+    """
+    Build attributes from text the DEVICE already read off an image (Apple Vision
+    OCR), instead of sending the pixels to the vision model.
+
+    Text-heavy screenshots and document photos are the bulk of captures; reading
+    them on-device and extracting from text on the fast model costs a fraction of
+    a vision call. Output mirrors extractAttributes(): the substance, not the
+    layout, and raw_text keeps the transcription (searchable, shown in detail).
+    """
+    from src.link_engine import DOMAIN_TOPICS  # local import: avoids any cycle
+
+    allowed = ", ".join(sorted(DOMAIN_TOPICS))
+    text = ocr_text.strip()
+    prompt = f"""This is text read by OCR from a phone screenshot or a photo of a document. Lines may be out of order and include UI chrome (status bar, clock, battery, buttons, tab bars, menus) — ignore that noise. Return ONLY valid JSON, no prose.
+
+OCR TEXT (truncated):
+{text[:6000]}
+
+Return JSON:
+{{
+  "title":        "<concise, specific title of WHAT this is>",
+  "summary":      "<the takeaway — see rules>",
+  "capture_type": "<screenshot|document|photo>",
+  "topics":       ["<1-3 broad English topic keywords — see Topics rule>"],
+  "category":     "<exactly ONE of: {allowed}>",
+  "people":       ["<real person names, or []>"],
+  "places":       ["<real place names / brands, or []>"],
+  "language":     "<ISO-639-1 code of the content>",
+  "sentiment":    "<positive|negative|neutral>"
+}}
+
+SUMMARY RULES — extract what's worth keeping, don't describe the screen:
+- Never write "a screenshot of…" / "the image shows…". State what it MEANS or is
+  FOR: the point, the decision, the fact worth remembering.
+- Open with 1-2 plain sentences of gist, then structure only if it helps:
+  • Recipe → ingredients with amounts from the text (never invent), then steps.
+  • Product / listing → what it is + key specs / price as a few bullets.
+  • Article / post → 3-5 bullet key points.
+  • Chat / message → who wants what, and any decision or date.
+  • Code / error → what it is and what it does or what's failing.
+- FORMATTING (rendered Markdown): section labels are "## " headings, never a bare
+  "Label:" line; bullets "- ", steps "1.". Keep it tight.
+
+{_TOPIC_RULES}{_lang_instruction(lang) or ' Write title and summary in the content language.'}"""
+
+    data = _complete_json(messages=[{"role": "user", "content": prompt}],
+                          lang=lang, max_tokens=1400)
+
+    topics = [t for t in data.get("topics", []) if isinstance(t, str)][:3]
+    category = (data.get("category") or "").strip().lower()
+    if category in DOMAIN_TOPICS and category not in [t.lower() for t in topics]:
+        topics.append(category)
+
+    try:
+        ct = CaptureType(data.get("capture_type", "screenshot"))
+    except ValueError:
+        ct = CaptureType.screenshot
+
+    return ExtractedAttributes(
+        title=data.get("title", ""),
+        summary=data.get("summary", ""),
+        raw_text=text[:4000],
+        capture_type=ct,
+        topics=topics,
+        people=[p for p in data.get("people", []) if isinstance(p, str)][:10],
+        places=[pl for pl in data.get("places", []) if isinstance(pl, str)][:10],
+        language=data.get("language", "en"),
+        sentiment=data.get("sentiment", "neutral"),
+        confidence=0.85,
+    )
+
+
 def extractAttributesFromNote(text: str, lang: str = "") -> ExtractedAttributes:
     """
     Attributes for the user's OWN note/idea (typed or dictated). Unlike a web

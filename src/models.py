@@ -92,10 +92,14 @@ class CaptureLink(BaseModel):
 # ── API request / response models ─────────────────────────────────────────────
 
 class AnalyzeCaptureRequest(BaseModel):
-    image_base64: str = Field(
-        ...,
+    # Either the image itself (vision path) or the text the device already read
+    # off it (ocr_text — the cheap path for text-heavy screenshots/documents).
+    image_base64: str | None = Field(
+        default=None,
         description="Base64-encoded image (JPEG / PNG / WebP)",
     )
+    ocr_text: str | None = None     # on-device OCR, sent INSTEAD of the image
+    image_hash: str | None = None   # sha256 of the base64 image, so the OCR path dedups too
     image_mime: str = Field(
         default="image/jpeg",
         pattern=r"^image/(jpeg|png|webp|gif)$",

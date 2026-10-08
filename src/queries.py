@@ -319,6 +319,16 @@ GET_BUG_IMAGE = """
 MATCH (b:BugImage {id: $id}) RETURN b.data AS data
 """
 
+# Which extractor produced an image capture: "ocr" (device read the text, fast
+# model) or "vision" (pixels to the vision model). Drives the cost measurement.
+SET_EXTRACTION_PATH = """
+MATCH (c:Capture {id: $id}) SET c.extraction_path = $path
+"""
+EXTRACTION_PATH_STATS = """
+MATCH (c:Capture) WHERE c.user_id = $uid AND c.extraction_path IS NOT NULL
+RETURN c.extraction_path AS path, count(c) AS n
+"""
+
 # Flag a just-persisted capture whose embedding came back empty (all zeros).
 SET_NEEDS_EMBEDDING = """
 MATCH (c:Capture {id: $id})

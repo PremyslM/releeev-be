@@ -79,6 +79,7 @@ from src.vision_extractor import (
     _lang_instruction,
     extractAttributes,
     extractAttributesFromNote,
+    extractAttributesFromScreenshotText,
     extractAttributesFromText,
     extractTopicsOnly,
     getEmbedding,
@@ -320,6 +321,20 @@ async def bug_report(
     return BugReportResponse(url=data["html_url"], number=data["number"])
 
 
+@app.get("/stats/extraction", summary="How image captures were extracted: on-device OCR vs vision")
+async def extraction_stats(user_id: str = Depends(get_current_user)) -> dict:
+    """Share of image captures that took the cheap path (device OCR → fast text
+    model) instead of a vision call. Only captures made since the OCR path
+    shipped carry the marker."""
+    async with get_session() as session:
+        rows = [r async for r in await session.run(Q.EXTRACTION_PATH_STATS, uid=user_id)]
+    counts = {r["path"]: r["n"] for r in rows}
+    ocr, vision = counts.get("ocr", 0), counts.get("vision", 0)
+    total = ocr + vision
+    return {"ocr": ocr, "vision": vision, "total": total,
+            "ocr_share": round(ocr / total, 3) if total else 0.0}
+
+
 @app.get("/bug-image/{img_id}", summary="Serve a stored bug screenshot (public, unguessable id)")
 async def bug_image(img_id: str) -> Response:
     """Public so GitHub can render the screenshot in the issue. The id is an
@@ -360,8 +375,19 @@ async def analyze_capture(
     """
     t0 = time.perf_counter()
 
+    if not req.image_base64 and not (req.ocr_text or "").strip():
+        raise HTTPException(status_code=422, detail="Chybí obrázek i přečtený text.")
+    # Text path: the device read the image itself, so send only what it read.
+    use_ocr = not req.image_base64 and bool((req.ocr_text or "").strip())
+
     # ── Deduplication — check if this exact image was already uploaded ────────
-    image_hash = hashlib.sha256(req.image_base64.encode()).hexdigest()
+    # The OCR path carries the device-computed hash of the same base64 image, so a
+    # screenshot dedups identically whichever way it was sent.
+    if req.image_base64:
+        image_hash = hashlib.sha256(req.image_base64.encode()).hexdigest()
+    else:
+        image_hash = req.image_hash or hashlib.sha256(
+            ("ocr:" + (req.ocr_text or "")).encode()).hexdigest()
     async with get_session() as session:
         dup_result = await session.run(Q.GET_CAPTURE_BY_HASH, image_hash=image_hash, uid=user_id)
         dup_record = await dup_result.single()
@@ -387,9 +413,12 @@ async def analyze_capture(
 
     # ── Extract ───────────────────────────────────────────────────────────────
     try:
-        attributes: ExtractedAttributes = extractAttributes(
-            req.image_base64, req.image_mime, lang=req.lang
-        )
+        if use_ocr:
+            attributes: ExtractedAttributes = extractAttributesFromScreenshotText(
+                req.ocr_text or "", lang=req.lang
+            )
+        else:
+            attributes = extractAttributes(req.image_base64, req.image_mime, lang=req.lang)
     except anthropic.AuthenticationError as exc:
         raise HTTPException(status_code=401, detail="Invalid Anthropic API key") from exc
     except anthropic.RateLimitError as exc:
@@ -411,9 +440,16 @@ async def analyze_capture(
     # ── Persist to Neo4j ──────────────────────────────────────────────────────
     try:
         await _persist_capture(capture, user_id)
+        # Which extractor produced this record — lets us measure how much of the
+        # image traffic the cheap on-device-OCR path absorbs.
+        async with get_session() as session:
+            await session.run(Q.SET_EXTRACTION_PATH, id=capture.id,
+                              path="ocr" if use_ocr else "vision")
     except Exception as exc:
         logger.error("Neo4j persist error: %s", exc)
         raise HTTPException(status_code=503, detail=f"Database error: {exc}") from exc
+    logger.info("analyze-capture via %s path (%s)", "OCR" if use_ocr else "vision",
+                capture.id[:8])
 
     # ── Capture location (place-anchored memory) ──────────────────────────────
     if req.lat is not None and req.lon is not None:
