@@ -45,11 +45,19 @@ class Settings(BaseSettings):
     # GITHUB_TOKEN needs `repo` scope; GITHUB_REPO is "owner/name".
     github_token: str = ""
     github_repo: str = ""
+    # Public base URL of this backend (e.g. https://releeev-be.vercel.app), used to
+    # build links GitHub can fetch (bug screenshots). Falls back to the request host.
+    public_base_url: str = ""
 
     # Run the idempotent schema bootstrap on startup. Safe to leave on locally;
     # on serverless (Vercel) set RUN_SCHEMA_SETUP=false after creating the schema
     # once, so cold starts don't re-run it.
     run_schema_setup: bool = True
+
+    # Shared secret Vercel Cron sends as "Authorization: Bearer <CRON_SECRET>".
+    # Guards /cron/keepalive, the daily write that keeps an Aura Free instance
+    # from being paused (and, after a long pause, deleted).
+    cron_secret: str = ""
 
     # Search reranking — a Voyage cross-encoder reorders the fused candidate set
     # for sharper top results. Falls back to the RRF order on any error.
@@ -93,6 +101,9 @@ class Settings(BaseSettings):
                 warnings.append("ANTHROPIC_API_KEY is empty — capture analysis will fail.")
             if self.neo4j_password in ("", "neo4j", "changeme", "12345678"):
                 warnings.append("NEO4J_PASSWORD looks like a placeholder/default.")
+            if not self.cron_secret:
+                warnings.append("CRON_SECRET is empty — the keepalive cron is refused, so an "
+                                "idle Aura Free instance can be paused and later deleted.")
         return fatal, warnings
 
 

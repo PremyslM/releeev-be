@@ -296,7 +296,46 @@ ORDER BY c.created_at ASC
 
 UPDATE_EMBEDDING = """
 MATCH (c:Capture {id: $id})
-SET c.embedding = $embedding
+SET c.embedding = $embedding, c.needs_embedding = false
+"""
+
+# Captures whose embedding failed (rate limit) and need a background retry.
+LIST_PENDING_EMBEDDINGS = """
+MATCH (c:Capture)
+WHERE c.user_id = $uid AND c.needs_embedding = true
+OPTIONAL MATCH (c)-[:HAS_TOPIC]->(t:Topic)
+WITH c, collect(t.name) AS topics
+RETURN c.id AS id, c.title AS title, c.summary AS summary, topics
+ORDER BY c.created_at DESC
+LIMIT $limit
+"""
+
+# Bug-report screenshots — stored here (not committed into the git repo) and
+# served by an unguessable id so GitHub can embed them in the issue.
+CREATE_BUG_IMAGE = """
+CREATE (b:BugImage {id: $id, data: $data, created_at: datetime()})
+"""
+GET_BUG_IMAGE = """
+MATCH (b:BugImage {id: $id}) RETURN b.data AS data
+"""
+
+# Which extractor produced an image capture: "ocr" (device read the text, fast
+# model) or "vision" (pixels to the vision model). Drives the cost measurement.
+SET_EXTRACTION_PATH = """
+MATCH (c:Capture {id: $id}) SET c.extraction_path = $path
+"""
+SET_CAPTURE_CAMERA = """
+MATCH (c:Capture {id: $id}) SET c.camera = $camera
+"""
+EXTRACTION_PATH_STATS = """
+MATCH (c:Capture) WHERE c.user_id = $uid AND c.extraction_path IS NOT NULL
+RETURN c.extraction_path AS path, count(c) AS n
+"""
+
+# Flag a just-persisted capture whose embedding came back empty (all zeros).
+SET_NEEDS_EMBEDDING = """
+MATCH (c:Capture {id: $id})
+SET c.needs_embedding = $flag
 """
 
 # ── Delete all LINKED_TO relationships (before full relink) ──────────────────
@@ -614,4 +653,38 @@ RETURN c.id           AS id,
        c.capture_type AS capture_type,
        c.created_at   AS created_at,
        collect(toLower(t.name)) AS topics
+"""
+
+
+# ── Backup / restore / ops ──────────────────────────────────────────────────────
+
+# Every capture of a user with its topics / people / places. The embedding is
+# dropped unless asked for: 1024 floats per record would dwarf the content and
+# is cheap to recompute on import.
+EXPORT_CAPTURES = """
+MATCH (c:Capture) WHERE c.user_id = $uid
+OPTIONAL MATCH (c)-[:HAS_TOPIC]->(t:Topic)
+WITH c, collect(DISTINCT t.name) AS topics
+OPTIONAL MATCH (c)-[:MENTIONS]->(p:Person)
+WITH c, topics, collect(DISTINCT p.name) AS people
+OPTIONAL MATCH (c)-[:MENTIONS]->(pl:Place)
+WITH c, topics, people, collect(DISTINCT pl.name) AS places
+RETURN CASE WHEN $embeddings THEN c {.*} ELSE c {.*, embedding: null} END AS c,
+       topics, people, places
+ORDER BY c.created_at
+"""
+
+CAPTURE_OWNER = """
+MATCH (c:Capture {id: $id}) RETURN c.user_id AS uid
+"""
+
+GET_USER_BY_ID = """
+MATCH (u:User {id: $id}) RETURN u.id AS id, u.email AS email
+"""
+
+# A daily write that keeps an Aura Free instance from being paused as idle.
+HEARTBEAT = """
+MERGE (h:Heartbeat {id: 'keepalive'})
+SET h.at = datetime(), h.beats = coalesce(h.beats, 0) + 1
+RETURN h.beats AS beats
 """

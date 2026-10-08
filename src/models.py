@@ -92,10 +92,15 @@ class CaptureLink(BaseModel):
 # ── API request / response models ─────────────────────────────────────────────
 
 class AnalyzeCaptureRequest(BaseModel):
-    image_base64: str = Field(
-        ...,
+    # Either the image itself (vision path) or the text the device already read
+    # off it (ocr_text — the cheap path for text-heavy screenshots/documents).
+    image_base64: str | None = Field(
+        default=None,
         description="Base64-encoded image (JPEG / PNG / WebP)",
     )
+    ocr_text: str | None = None     # on-device OCR, sent INSTEAD of the image
+    image_hash: str | None = None   # sha256 of the base64 image, so the OCR path dedups too
+    camera: str | None = None       # "Apple iPhone 15 Pro – Main Camera 24 mm" (from EXIF)
     image_mime: str = Field(
         default="image/jpeg",
         pattern=r"^image/(jpeg|png|webp|gif)$",
@@ -127,8 +132,11 @@ class UpdateCaptureRequest(BaseModel):
 
 
 class ReanalyzeRequest(BaseModel):
-    """Ask the model to re-extract a capture from its source (URL or note text)."""
+    """Ask the model to re-extract a capture from its source. For a photo the
+    image lives only on the device, so the client re-sends it here."""
     lang: str = ""                  # device language ISO code — write records in it
+    image_base64: str | None = None  # for photo captures: the on-device image
+    image_mime: str = "image/jpeg"
 
 
 class LinkedCapture(BaseModel):
@@ -182,6 +190,45 @@ class CaptureDetailResponse(BaseModel):
     subject: SubjectInfo | None = None
     location: LocationInfo | None = None
     context: str = ""                # personalised insight: how it fits your brain
+    camera: str = ""                 # camera that took the photo (EXIF), "" if unknown
+
+
+# ── Backup / restore ─────────────────────────────────────────────────────────────
+
+class BackupItem(BaseModel):
+    """One capture as exported / imported. A cached `GET /captures/{id}` response
+    is a valid item too — its extra keys (connections, subject) are ignored — so
+    a device can restore straight from its offline cache."""
+    capture: CaptureNode
+    location: LocationInfo | None = None
+    context: str = ""
+    camera: str = ""
+
+
+class BackupFile(BaseModel):
+    """Everything a user has captured, as one file that /import can restore."""
+    version: int = 1
+    exported_at: datetime = Field(default_factory=datetime.utcnow)
+    count: int = 0
+    items: list[BackupItem] = Field(default_factory=list)
+
+
+class ImportRequest(BaseModel):
+    # Small batches keep each request well inside the serverless time limit.
+    items: list[BackupItem] = Field(default_factory=list, max_length=100)
+
+
+class ImportResponse(BaseModel):
+    imported: int = 0
+    skipped: int = 0                 # already in the database — import is idempotent
+    embedded: int = 0                # vectors recomputed during the import
+    ids: list[str] = Field(default_factory=list)   # newly imported capture ids
+
+
+class RestoreAccountRequest(BaseModel):
+    """Recreate the account row for a still-valid session after a database loss."""
+    email: str
+    password: str = Field(min_length=6)
 
 
 class SearchResult(BaseModel):

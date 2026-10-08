@@ -9,6 +9,7 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import logging
 import time
@@ -18,7 +19,8 @@ from datetime import datetime
 from functools import lru_cache
 
 import anthropic
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -36,6 +38,11 @@ from src.models import (
     AskResponse,
     AskSource,
     AuthResponse,
+    BackupFile,
+    BackupItem,
+    ImportRequest,
+    ImportResponse,
+    RestoreAccountRequest,
     BugReportRequest,
     BugReportResponse,
     LoginRequest,
@@ -77,6 +84,7 @@ from src.vision_extractor import (
     _lang_instruction,
     extractAttributes,
     extractAttributesFromNote,
+    extractAttributesFromScreenshotText,
     extractAttributesFromText,
     extractTopicsOnly,
     getEmbedding,
@@ -197,6 +205,12 @@ async def _persist_capture(capture: CaptureNode, user_id: str) -> None:
         for place in attrs.places:
             await session.run(Q.UPSERT_PLACE, name=place, capture_id=capture.id)
 
+        # If the embedding came back empty (Voyage rate limit), flag the capture
+        # so the background drain re-embeds and relinks it — no permanently
+        # unlinkable, unsearchable record.
+        zero = not any(v != 0.0 for v in (capture.embedding or [])[:16])
+        await session.run(Q.SET_NEEDS_EMBEDDING, id=capture.id, flag=zero)
+
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -229,7 +243,37 @@ async def login(req: LoginRequest) -> AuthResponse:
 
 @app.get("/auth/me", summary="Who am I (validates the token)")
 async def whoami(user_id: str = Depends(get_current_user)):
-    return {"user_id": user_id}
+    # `account`: does this token's user still exist in the database? False after
+    # a database loss — the session is valid, but logging in again would fail
+    # until /auth/restore-account recreates the row. None if the DB is down.
+    account: bool | None = None
+    try:
+        async with get_session() as session:
+            account = (await (await session.run(Q.GET_USER_BY_ID, id=user_id)).single()) is not None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("whoami: account lookup failed: %s", exc)
+    return {"user_id": user_id, "account": account}
+
+
+@app.post("/auth/restore-account", response_model=AuthResponse,
+          summary="Recreate the account for a still-valid session after a database loss")
+async def restore_account(
+    req: RestoreAccountRequest, user_id: str = Depends(get_current_user),
+) -> AuthResponse:
+    """The token was signed by us for `user_id`, but that user's row is gone
+    (e.g. the database was lost). Recreate it under the SAME id with a new
+    password, so restored captures stay this account's and login works again."""
+    email = req.email.strip().lower()
+    if "@" not in email or "." not in email:
+        raise HTTPException(status_code=400, detail="Neplatný e-mail.")
+    async with get_session() as session:
+        if (await (await session.run(Q.GET_USER_BY_ID, id=user_id)).single()) is not None:
+            raise HTTPException(status_code=409, detail="Účet už existuje.")
+        if (await (await session.run(Q.GET_USER_BY_EMAIL, email=email)).single()) is not None:
+            raise HTTPException(status_code=409, detail="Tento e-mail už používá jiný účet.")
+        await session.run(Q.CREATE_USER, id=user_id, email=email,
+                          password_hash=hash_password(req.password))
+    return AuthResponse(token=create_token(user_id), user_id=user_id, email=email)
 
 
 @app.post("/auth/claim-orphans",
@@ -252,6 +296,7 @@ async def claim_orphans(user_id: str = Depends(get_current_user)):
           summary="File an in-app bug report as a GitHub issue")
 async def bug_report(
     req: BugReportRequest,
+    request: Request,
     user_id: str = Depends(get_current_user),
 ) -> BugReportResponse:
     """
@@ -275,22 +320,20 @@ async def bug_report(
     }
     body = [req.description.strip() or "_(bez popisu)_"]
 
-    async with httpx.AsyncClient(timeout=20) as client:
-        # Optional screenshot: commit it into the repo, then embed its raw URL.
-        if req.image_base64:
-            path = f"bug-reports/{uuid4().hex}.jpg"
-            try:
-                up = await client.put(
-                    f"{api}/contents/{path}", headers=headers,
-                    json={"message": f"chore: bug screenshot {path}", "content": req.image_base64},
-                )
-                if up.status_code in (200, 201):
-                    dl = (up.json().get("content") or {}).get("download_url")
-                    if dl:
-                        body.append(f"\n\n![screenshot]({dl})")
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Bug screenshot upload failed (non-fatal): %s", exc)
+    # Optional screenshot: store it in the DB (NOT committed into the repo) and
+    # embed a link the GitHub issue can fetch — no repo-history bloat.
+    if req.image_base64:
+        img_id = uuid4().hex
+        try:
+            async with get_session() as session:
+                await session.run(Q.CREATE_BUG_IMAGE, id=img_id, data=req.image_base64)
+            base = (settings.public_base_url or str(request.base_url)).rstrip("/")
+            base = base.replace("http://", "https://")   # GitHub only proxies https
+            body.append(f"\n\n![screenshot]({base}/bug-image/{img_id})")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Bug screenshot store failed (non-fatal): %s", exc)
 
+    async with httpx.AsyncClient(timeout=20) as client:
         meta = []
         if req.app_version: meta.append(f"app: `{req.app_version}`")
         if req.device: meta.append(f"device: `{req.device}`")
@@ -311,6 +354,38 @@ async def bug_report(
                             detail=f"GitHub API {issue.status_code}: {issue.text[:200]}")
     data = issue.json()
     return BugReportResponse(url=data["html_url"], number=data["number"])
+
+
+@app.get("/stats/extraction", summary="How image captures were extracted: on-device OCR vs vision")
+async def extraction_stats(user_id: str = Depends(get_current_user)) -> dict:
+    """Share of image captures that took the cheap path (device OCR → fast text
+    model) instead of a vision call. Only captures made since the OCR path
+    shipped carry the marker."""
+    async with get_session() as session:
+        rows = [r async for r in await session.run(Q.EXTRACTION_PATH_STATS, uid=user_id)]
+    counts = {r["path"]: r["n"] for r in rows}
+    ocr, vision = counts.get("ocr", 0), counts.get("vision", 0)
+    total = ocr + vision
+    return {"ocr": ocr, "vision": vision, "total": total,
+            "ocr_share": round(ocr / total, 3) if total else 0.0}
+
+
+@app.get("/bug-image/{img_id}", summary="Serve a stored bug screenshot (public, unguessable id)")
+async def bug_image(img_id: str) -> Response:
+    """Public so GitHub can render the screenshot in the issue. The id is an
+    unguessable uuid; there is nothing sensitive to enumerate."""
+    if not img_id.isalnum():
+        raise HTTPException(status_code=400, detail="Bad id.")
+    async with get_session() as session:
+        rec = await (await session.run(Q.GET_BUG_IMAGE, id=img_id)).single()
+    if rec is None or not rec["data"]:
+        raise HTTPException(status_code=404, detail="Not found.")
+    try:
+        raw = base64.b64decode(rec["data"])
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail="Corrupt image.") from exc
+    return Response(content=raw, media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=31536000"})
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -335,8 +410,19 @@ async def analyze_capture(
     """
     t0 = time.perf_counter()
 
+    if not req.image_base64 and not (req.ocr_text or "").strip():
+        raise HTTPException(status_code=422, detail="Chybí obrázek i přečtený text.")
+    # Text path: the device read the image itself, so send only what it read.
+    use_ocr = not req.image_base64 and bool((req.ocr_text or "").strip())
+
     # ── Deduplication — check if this exact image was already uploaded ────────
-    image_hash = hashlib.sha256(req.image_base64.encode()).hexdigest()
+    # The OCR path carries the device-computed hash of the same base64 image, so a
+    # screenshot dedups identically whichever way it was sent.
+    if req.image_base64:
+        image_hash = hashlib.sha256(req.image_base64.encode()).hexdigest()
+    else:
+        image_hash = req.image_hash or hashlib.sha256(
+            ("ocr:" + (req.ocr_text or "")).encode()).hexdigest()
     async with get_session() as session:
         dup_result = await session.run(Q.GET_CAPTURE_BY_HASH, image_hash=image_hash, uid=user_id)
         dup_record = await dup_result.single()
@@ -362,9 +448,12 @@ async def analyze_capture(
 
     # ── Extract ───────────────────────────────────────────────────────────────
     try:
-        attributes: ExtractedAttributes = extractAttributes(
-            req.image_base64, req.image_mime, lang=req.lang
-        )
+        if use_ocr:
+            attributes: ExtractedAttributes = extractAttributesFromScreenshotText(
+                req.ocr_text or "", lang=req.lang
+            )
+        else:
+            attributes = extractAttributes(req.image_base64, req.image_mime, lang=req.lang)
     except anthropic.AuthenticationError as exc:
         raise HTTPException(status_code=401, detail="Invalid Anthropic API key") from exc
     except anthropic.RateLimitError as exc:
@@ -386,9 +475,18 @@ async def analyze_capture(
     # ── Persist to Neo4j ──────────────────────────────────────────────────────
     try:
         await _persist_capture(capture, user_id)
+        # Which extractor produced this record — lets us measure how much of the
+        # image traffic the cheap on-device-OCR path absorbs.
+        async with get_session() as session:
+            await session.run(Q.SET_EXTRACTION_PATH, id=capture.id,
+                              path="ocr" if use_ocr else "vision")
+            if req.camera:
+                await session.run(Q.SET_CAPTURE_CAMERA, id=capture.id, camera=req.camera[:120])
     except Exception as exc:
         logger.error("Neo4j persist error: %s", exc)
         raise HTTPException(status_code=503, detail=f"Database error: {exc}") from exc
+    logger.info("analyze-capture via %s path (%s)", "OCR" if use_ocr else "vision",
+                capture.id[:8])
 
     # ── Capture location (place-anchored memory) ──────────────────────────────
     if req.lat is not None and req.lon is not None:
@@ -438,6 +536,7 @@ async def analyze_capture(
     # Rewrite the documents this capture just made out of date, after the
     # response — so opening the topic later is instant, not a 10s model wait.
     background.add_task(_precompute_topic_docs, user_id, attributes.topics, req.lang)
+    background.add_task(_drain_pending_embeddings, user_id)
 
     return AnalyzeCaptureResponse(
         capture_id=capture.id,
@@ -762,6 +861,7 @@ async def analyze_url(
     # Rewrite the documents this capture just made out of date, after the
     # response — so opening the topic later is instant, not a 10s model wait.
     background.add_task(_precompute_topic_docs, user_id, attributes.topics, req.lang)
+    background.add_task(_drain_pending_embeddings, user_id)
 
     return AnalyzeCaptureResponse(
         capture_id=capture.id,
@@ -891,6 +991,7 @@ async def analyze_note(
     # Rewrite the documents this capture just made out of date, after the
     # response — so opening the topic later is instant, not a 10s model wait.
     background.add_task(_precompute_topic_docs, user_id, attributes.topics, req.lang)
+    background.add_task(_drain_pending_embeddings, user_id)
 
     return AnalyzeCaptureResponse(
         capture_id=capture.id, attributes=attributes, embedding_dim=len(embedding),
@@ -926,6 +1027,33 @@ async def recent_captures(
     return SearchResponse(query="", results=results, total=len(results), facets={})
 
 
+def _attrs_from_node(node, record) -> ExtractedAttributes:
+    """A stored Capture node (+ its topics/people/places from the record) back
+    into ExtractedAttributes — shared by the detail and the export."""
+    return ExtractedAttributes(
+        title=node.get("title", "") or "",
+        summary=node.get("summary", "") or "",
+        raw_text=node.get("raw_text", "") or "",
+        capture_type=node.get("capture_type") or CaptureType.unknown,
+        language=node.get("language", "en") or "en",
+        sentiment=node.get("sentiment", "neutral") or "neutral",
+        confidence=node.get("confidence", 1.0) if node.get("confidence") is not None else 1.0,
+        topics=[t for t in (record.get("topics") or []) if t],
+        people=[p for p in (record.get("people") or []) if p],
+        places=[pl for pl in (record.get("places") or []) if pl],
+        kind=node.get("kind", "") or "",
+        author=node.get("author", "") or "",
+        extra={
+            k: v for k, v in (
+                ("url", node.get("url")),
+                ("og_image", node.get("og_image")),
+                ("site_name", node.get("site_name")),
+                ("page_description", node.get("page_description")),
+            ) if v
+        },
+    )
+
+
 @app.get(
     "/captures/{capture_id}",
     response_model=CaptureDetailResponse,
@@ -946,28 +1074,7 @@ async def get_capture(
         node = record["c"]
 
         # Parse attributes — topics/people/places come from related nodes in graph
-        attrs = ExtractedAttributes(
-            title=node.get("title", ""),
-            summary=node.get("summary", ""),
-            raw_text=node.get("raw_text", ""),
-            capture_type=node.get("capture_type") or CaptureType.unknown,
-            language=node.get("language", "en"),
-            sentiment=node.get("sentiment", "neutral"),
-            confidence=node.get("confidence", 1.0),
-            topics=[t for t in (record.get("topics") or []) if t],
-            people=[p for p in (record.get("people") or []) if p],
-            places=[pl for pl in (record.get("places") or []) if pl],
-            kind=node.get("kind", "") or "",
-            author=node.get("author", "") or "",
-            extra={
-                k: v for k, v in (
-                    ("url", node.get("url")),
-                    ("og_image", node.get("og_image")),
-                    ("site_name", node.get("site_name")),
-                    ("page_description", node.get("page_description")),
-                ) if v
-            },
-        )
+        attrs = _attrs_from_node(node, record)
         capture = CaptureNode(
             id=node["id"],
             # Read the stored creation time — without this, CaptureNode's
@@ -1044,7 +1151,8 @@ async def get_capture(
 
     return CaptureDetailResponse(capture=capture, connections=connections,
                                  subject=subject, location=location,
-                                 context=node.get("context", "") or "")
+                                 context=node.get("context", "") or "",
+                                 camera=node.get("camera", "") or "")
 
 
 @app.delete("/captures/{capture_id}", summary="Delete a capture")
@@ -1090,10 +1198,10 @@ async def reanalyze_capture(
     req: ReanalyzeRequest,
     user_id: str = Depends(get_current_user),
 ) -> CaptureDetailResponse:
-    """Re-run extraction against whatever source the capture still has — the
-    web page (re-fetched) or the note text. Handy when an early extraction was
-    poor, or to refresh old captures with an improved extractor. Photos can't be
-    re-analyzed here (their image lives only on the device)."""
+    """Re-run extraction against whatever source the capture has — a photo (the
+    client re-sends the on-device image), the web page (re-fetched), or the note
+    text. Handy when an early extraction was poor, or to refresh old captures
+    with an improved extractor."""
     async with get_session() as session:
         rec = await (await session.run(Q.GET_CAPTURE_BY_ID, id=capture_id, uid=user_id)).single()
         if rec is None:
@@ -1103,7 +1211,13 @@ async def reanalyze_capture(
     url = node.get("url") or ""
     raw_text = node.get("raw_text") or ""
 
-    if url:
+    if req.image_base64:
+        # Photo: re-run vision extraction on the image the device sent back.
+        try:
+            attrs = extractAttributes(req.image_base64, req.image_mime, lang=req.lang)
+        except anthropic.APIError as exc:
+            raise HTTPException(status_code=502, detail=f"Claude API error: {exc}") from exc
+    elif url:
         signals: dict = {}
         text = ""
         try:
@@ -1148,6 +1262,13 @@ async def reanalyze_capture(
             await session.run(Q.UPSERT_PERSON, name=p, capture_id=capture_id)
         for pl in attrs.places:
             await session.run(Q.UPSERT_PLACE, name=pl, capture_id=capture_id)
+        # Topics + embedding changed, so the old links are stale — rebuild them.
+        await session.run("MATCH (c:Capture {id: $id})-[r:LINKED_TO]-() DELETE r", id=capture_id)
+
+    if any(v != 0.0 for v in (embedding or [])[:10]):
+        linked = await findSimilarCaptures(capture_id, attrs, embedding)
+        if linked:
+            await persistLinks(capture_id, linked)
 
     return await get_capture(capture_id, user_id)
 
@@ -1479,6 +1600,39 @@ async def _precompute_topic_docs(user_id: str, topics: list[str], lang: str) -> 
     the user never opens a topic and waits for the model."""
     for topic in {t.strip().lower() for t in topics if t.strip()}:
         await _compile_topic_doc(user_id, topic, lang)
+
+
+async def _drain_pending_embeddings(user_id: str, limit: int = 12) -> None:
+    """Heal captures whose embedding failed under a Voyage rate-limit spike:
+    re-embed them in ONE batched request (durable client, backs off), then relink.
+    Runs in the background after each capture, so a burst self-heals over the next
+    few captures instead of leaving dead, unlinkable records."""
+    try:
+        async with get_session() as s:
+            rows = [r async for r in await s.run(
+                Q.LIST_PENDING_EMBEDDINGS, uid=user_id, limit=limit)]
+        if not rows:
+            return
+        from src.vision_extractor import getEmbeddingsBatch
+        texts = [f"{(r['title'] or '')} {(r['summary'] or '')}".strip() or " " for r in rows]
+        loop = asyncio.get_running_loop()
+        embeddings = await loop.run_in_executor(None, getEmbeddingsBatch, texts)
+
+        healed = 0
+        for r, emb in zip(rows, embeddings):
+            if not any(v != 0.0 for v in emb[:10]):
+                continue  # still rate-limited — stays flagged for the next drain
+            async with get_session() as s:
+                await s.run(Q.UPDATE_EMBEDDING, id=r["id"], embedding=emb)  # clears the flag
+            attrs = ExtractedAttributes(title=r["title"] or "", summary=r["summary"] or "")
+            linked = await findSimilarCaptures(r["id"], attrs, emb)
+            if linked:
+                await persistLinks(r["id"], linked)
+            healed += 1
+        if healed:
+            logger.info("Drained %d pending embeddings for %s", healed, user_id[:8])
+    except Exception as exc:  # noqa: BLE001 — background heal must never surface
+        logger.warning("Pending-embedding drain failed (non-fatal): %s", exc)
 
 
 @app.get("/topics/{name}/doc", response_model=TopicDocResponse,
@@ -2639,7 +2793,155 @@ async def get_graph_data(user_id: str = Depends(get_current_user)):
 
 @app.get("/health", include_in_schema=False)
 async def health():
-    return {"status": "ok", "env": settings.app_env}
+    """Liveness INCLUDING the database. A plain 200 here once hid a deleted Aura
+    instance for weeks — now a dead DB answers 503."""
+    async def ping() -> None:
+        async with get_session() as session:
+            await (await session.run("RETURN 1 AS ok")).single()
+    try:
+        await asyncio.wait_for(ping(), timeout=8)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Health: database unreachable: %s", exc)
+        return JSONResponse(status_code=503, content={
+            "status": "degraded", "env": settings.app_env, "db": type(exc).__name__,
+        })
+    return {"status": "ok", "env": settings.app_env, "db": "ok"}
+
+
+@app.get("/cron/keepalive", include_in_schema=False)
+async def cron_keepalive(authorization: str = Header(default="")):
+    """Daily write (Vercel Cron) so an Aura Free instance never sits idle long
+    enough to be paused — a long-paused free instance gets deleted."""
+    if settings.cron_secret:
+        if authorization != f"Bearer {settings.cron_secret}":
+            raise HTTPException(status_code=401, detail="Bad cron secret.")
+    elif settings.is_production:
+        raise HTTPException(status_code=503, detail="CRON_SECRET is not configured.")
+    async with get_session() as session:
+        rec = await (await session.run(Q.HEARTBEAT)).single()
+    return {"ok": True, "beats": rec["beats"] if rec else 0}
+
+
+# ── Backup / restore ──────────────────────────────────────────────────────────
+
+@app.get("/export", response_model=BackupFile,
+         summary="Everything you've captured, as one restorable file")
+async def export_brain(
+    embeddings: bool = Query(False, description="Include the 1024-dim vectors"),
+    user_id: str = Depends(get_current_user),
+) -> BackupFile:
+    items: list[BackupItem] = []
+    async with get_session() as session:
+        result = await session.run(Q.EXPORT_CAPTURES, uid=user_id, embeddings=embeddings)
+        async for rec in result:
+            node = rec["c"]
+            capture = CaptureNode(
+                id=node["id"],
+                created_at=_to_native(node.get("created_at")) or datetime.utcnow(),
+                image_hash=node.get("image_hash", "") or "",
+                attributes=_attrs_from_node(node, rec),
+                embedding=list(node.get("embedding") or []) if embeddings else [],
+            )
+            location = None
+            if node.get("lat") is not None and node.get("lon") is not None:
+                location = LocationInfo(
+                    lat=float(node["lat"]), lon=float(node["lon"]),
+                    place=node.get("place") or "", locality=node.get("locality") or "",
+                    captured_at=node.get("captured_at"),
+                )
+            items.append(BackupItem(capture=capture, location=location,
+                                    context=node.get("context", "") or "",
+                                    camera=node.get("camera", "") or ""))
+    return BackupFile(count=len(items), items=items)
+
+
+async def _link_imported(entries: list[tuple[str, ExtractedAttributes, list[float]]]) -> None:
+    """Draw links for freshly imported captures (after the response). Each later
+    batch links back to the earlier ones, so a batched restore ends up fully linked."""
+    for cid, attrs, emb in entries:
+        if not any(v != 0.0 for v in (emb or [])[:10]):
+            continue
+        try:
+            linked = await findSimilarCaptures(cid, attrs, emb)
+            if linked:
+                await persistLinks(cid, linked)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Import relink failed for %s: %s", cid[:8], exc)
+
+
+@app.post("/import", response_model=ImportResponse,
+          summary="Restore captures from a backup (or a device's offline cache)")
+async def import_brain(
+    req: ImportRequest,
+    background: BackgroundTasks,
+    user_id: str = Depends(get_current_user),
+) -> ImportResponse:
+    """Recreate captures with their ORIGINAL ids and dates — so photos the device
+    keeps by capture id still match. Idempotent: ids already present are
+    skipped, so an interrupted restore can simply be run again."""
+    fresh: list[CaptureNode] = []
+    skipped = 0
+    for item in req.items:
+        cap = item.capture
+        if not cap.id:
+            continue
+        async with get_session() as session:
+            owner = await (await session.run(Q.CAPTURE_OWNER, id=cap.id)).single()
+        if owner is not None:
+            skipped += 1          # already restored (or someone else's id) — never overwrite
+            continue
+        if len(cap.embedding or []) != 1024:
+            cap.embedding = [0.0] * 1024      # flagged needs_embedding by the persist
+        await _persist_capture(cap, user_id)
+
+        extra = cap.attributes.extra or {}
+        async with get_session() as session:
+            if extra.get("url"):
+                await session.run(Q.SET_CAPTURE_URL, id=cap.id, url=extra["url"])
+            if any(extra.get(k) for k in ("og_image", "site_name", "page_description")):
+                await session.run(Q.SET_CAPTURE_PREVIEW, id=cap.id,
+                                  og_image=extra.get("og_image") or "",
+                                  site_name=extra.get("site_name") or "",
+                                  page_description=extra.get("page_description") or "")
+            loc = item.location
+            if loc is not None:
+                await session.run(Q.SET_CAPTURE_LOCATION, id=cap.id, lat=loc.lat, lon=loc.lon,
+                                  place=loc.place, locality=loc.locality,
+                                  captured_at=loc.captured_at)
+                if loc.place:
+                    await session.run(Q.UPSERT_LOCATION, id=cap.id, name=loc.place,
+                                      locality=loc.locality, lat=loc.lat, lon=loc.lon)
+            if item.context:
+                await session.run(Q.SET_CAPTURE_CONTEXT, id=cap.id, context=item.context)
+            if item.camera:
+                await session.run(Q.SET_CAPTURE_CAMERA, id=cap.id, camera=item.camera[:120])
+        fresh.append(cap)
+
+    # Records without a vector (exports omit them) → one batched embedding call.
+    embedded = 0
+    missing = [c for c in fresh if not any(v != 0.0 for v in c.embedding[:16])]
+    if missing:
+        from src.vision_extractor import getEmbeddingsBatch
+        texts = [(f"{c.attributes.title} {c.attributes.summary} "
+                  f"{' '.join(c.attributes.topics)}").strip() or " " for c in missing]
+        try:
+            vectors = await asyncio.get_running_loop().run_in_executor(
+                None, getEmbeddingsBatch, texts)
+        except Exception as exc:  # noqa: BLE001 — stays flagged; the drain heals it
+            logger.warning("Import embedding failed (left for the drain): %s", exc)
+            vectors = []
+        for c, vec in zip(missing, vectors):
+            if any(v != 0.0 for v in vec[:10]):
+                async with get_session() as session:
+                    await session.run(Q.UPDATE_EMBEDDING, id=c.id, embedding=vec)
+                c.embedding = vec
+                embedded += 1
+
+    background.add_task(_link_imported, [(c.id, c.attributes, c.embedding) for c in fresh])
+    background.add_task(_drain_pending_embeddings, user_id)
+    logger.info("Import: %d new, %d skipped, %d embedded", len(fresh), skipped, embedded)
+    return ImportResponse(imported=len(fresh), skipped=skipped, embedded=embedded,
+                          ids=[c.id for c in fresh])
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
